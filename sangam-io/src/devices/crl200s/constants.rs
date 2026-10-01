@@ -23,6 +23,14 @@ pub const CMD_BUTTON_LED: u8 = 0x8D; // LED state (0=off, 1=charging, 3=discharg
 
 // Lidar control commands
 pub const CMD_MOTOR_MODE: u8 = 0x65; // Motor mode switch (0x02 = navigation mode)
+/// Lidar start step 2 (measured on this unit, 2026-10-01 field capture).
+///
+/// The stock firmware sends this between `0x97 01` (power on) and the `0x71 100`
+/// spin-up, as part of a fixed burst: `0x65 02` -> `0xA2 10 0E 00 00` -> `0x97 01`
+/// -> `0x9D 01` -> `0x71 100` (~1.3 s) -> `0x71 73`. Sending only `0x97 01` +
+/// `0x71 <pwm>` leaves the lidar motor stopped (ttyS1 receives 0 bytes).
+/// Semantics are not documented upstream; the name reflects the observed role.
+pub const CMD_LIDAR_START: u8 = 0x9D;
 pub const CMD_LIDAR_POWER: u8 = 0x97; // Lidar power on/off
 pub const CMD_LIDAR_PWM: u8 = 0x71; // Lidar motor speed (0-100%)
 

@@ -237,6 +237,17 @@ impl TxPacket {
         self.finalize(1);
     }
 
+    /// Set lidar start step 2 (CMD 0x9D, payload 0x01)
+    ///
+    /// Part of the measured lidar start burst — see [`CMD_LIDAR_START`].
+    #[inline]
+    pub fn set_lidar_start(&mut self) {
+        self.data[2] = 4;
+        self.data[3] = CMD_LIDAR_START;
+        self.data[4] = 0x01;
+        self.finalize(1);
+    }
+
     /// Set cliff IR control (CMD 0x78)
     #[inline]
     pub fn set_cliff_ir(&mut self, enable: bool) {
