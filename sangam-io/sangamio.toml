@@ -32,8 +32,10 @@ heartbeat_interval_ms = 20
 # Lidar motor PWM duty cycle (0-100%)
 # Controls the speed of the lidar motor
 # Higher values = faster rotation = higher scan rate
-# Default: 60 (provides ~330 RPM / 5.5 Hz scan rate)
-lidar_pwm = 60
+# Measured on this unit (2026-10-01, 13 min of field capture): the stock firmware
+# runs 73 in operation (100 appears only during spin-up), giving ~6.3 Hz / ~380 RPM.
+# The upstream default of 60 was an estimate; 73 is the observed value.
+lidar_pwm = 73
 
 # Lidar mounting configuration
 # Defines the physical mounting position of the lidar relative to robot center.

@@ -10,8 +10,10 @@ timeout_ms = 5000
 
 [robot]
 # CRL-200S robot parameters
-wheel_base = 0.233        # Distance between wheels (meters)
-ticks_per_meter = 4464.0  # Encoder ticks per meter of travel
+# ticks_per_meter / wheel_base measured on this unit 2026-09-30 with a tape measure:
+# 1 tick = 0.2214 mm and 16.5 ticks of difference per degree -> 209 mm wheel base.
+wheel_base = 0.209        # Distance between wheels (meters)
+ticks_per_meter = 4516.7  # Encoder ticks per meter of travel
 max_linear_vel = 0.2      # Maximum linear velocity (m/s)
 max_angular_vel = 0.5     # Maximum angular velocity (rad/s)
 

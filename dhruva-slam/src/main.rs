@@ -324,8 +324,10 @@ impl Default for OdometryConfig {
     fn default() -> Self {
         Self {
             algorithm: "mahony".to_string(),
-            ticks_per_meter: 4464.0,
-            wheel_base: 0.233,
+            // CRL-200S defaults measured on this unit (2026-09-30, tape measure):
+            // 1 tick = 0.2214 mm -> 4516.7 ticks/m; 209 mm wheel base.
+            ticks_per_meter: 4516.7,
+            wheel_base: 0.209,
         }
     }
 }

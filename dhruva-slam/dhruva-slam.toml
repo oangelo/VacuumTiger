@@ -65,10 +65,15 @@ path = "/var/lib/dhruva/maps"
 algorithm = "wheel"
 
 # Encoder ticks per meter of wheel travel
-ticks_per_meter = 4464.0
+# Measured on this unit (2026-09-30) with a tape measure over two runs (1.02 m and
+# 3.04 m, agreeing within 2.5%): 1 tick = 0.2214 mm -> 4516.7 ticks/m. The upstream
+# value of 4464.0 was an estimate.
+ticks_per_meter = 4516.7
 
 # Distance between wheel centers in meters
-wheel_base = 0.233
+# Derived from the same measurement: 16.5 ticks of left/right counter difference per
+# degree of rotation -> 209 mm wheel base (not 233 mm).
+wheel_base = 0.209
 
 # ============================================================================
 # Lidar Configuration
