@@ -430,9 +430,14 @@ impl SlamContext {
     ) {
         // Update odometry
         if let Some(odom_pose) = self.odometry.update(left, right, gyro_yaw, timestamp_us) {
-            self.odom_tracker.set(odom_pose);
+            // odom_pose e' o DELTA incremental desta amostra (ex: ~0.001m a 323Hz).
+            // O PoseTracker acumula via update() (compose); set() SUBSTITUIRIA a
+            // pose acumulada pelo delta isolado -> odom_tracker.pose() ~0 sempre
+            // -> process_lidar calcula odom_delta ~0 -> o SLAM nunca ve a rotacao
+            // medido: odom_delta=(0,0,0) com o robo girando 100° em 10s.
+            self.odom_tracker.update(&odom_pose);
 
-            // Interpolate: slam_pose + delta since last SLAM update
+            // Odometry since the last odometry update (for interpolated pose).
             let odom_delta = self.last_odom_pose.inverse().compose(&odom_pose);
             let published_pose = self.slam.current_pose().compose(&odom_delta);
 
