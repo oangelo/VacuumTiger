@@ -150,6 +150,18 @@ impl PacketReader {
 
             // Step 3: Read length and wait for complete packet
             let len = self.buffer[2];
+
+            // A valid frame needs LEN >= 3 (CMD + CRC). Anything shorter means the
+            // FA FB pair was a FALSE sync (they can occur inside payload data) and must
+            // not be treated as a frame: with LEN 0..2 the slice `buffer[3..total_len-2]`
+            // in verify_checksum() ends before it starts and the reader thread PANICS
+            // ("slice index starts at 3 but ends at 1", bench 2026-10-01) -- which kills
+            // the whole sensor stream for the rest of the session.
+            if len < 3 {
+                self.buffer.drain(..1);
+                continue;
+            }
+
             let total_len = 3 + len as usize; // SYNC(2) + LEN(1) + DATA(len)
 
             // Wait until buffer has complete packet

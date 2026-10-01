@@ -149,8 +149,12 @@ pub(super) fn heartbeat_loop(
         }
 
         if component_state.motor_mode_set.load(Ordering::Relaxed) {
-            // Send motor mode 0x02 periodically to keep GD32 in navigation mode
-            let _ = motor_mode_nav.send_to(&mut *port);
+            // NAO reenviar 0x65 02 a cada ciclo: medido em bancada (01/10/2026) com o
+            // instrumento `lidar_init_test`, mesma ordem de start e mesmo PWM:
+            //   regime [0x66 + 0x71]      -> 8.000 B/s no ttyS1 (motor rodando)
+            //   regime [0x65 02 + 0x71]   -> 0 byte, motor PARA e nao volta na sessao
+            // A fabrica manda o 0x65 02 UMA vez (esta no burst de start) e depois so
+            // 0x66 a ~50 Hz + 0x71. O modo 0x02 fica latcheado no GD32.
 
             // Motor mode 0x02 active - send velocity command as heartbeat
             pkt.set_velocity(linear, angular);

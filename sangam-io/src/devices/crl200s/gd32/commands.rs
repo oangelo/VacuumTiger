@@ -44,6 +44,8 @@ use crate::error::{Error, Result};
 use serialport::SerialPort;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 // ============================================================================
 // Constants
@@ -68,9 +70,12 @@ const ANGULAR_UNITS_PER_RADS: f32 = 523.0;
 /// Default IMU calibration payload observed in R2D logs
 const IMU_DEFAULT_PAYLOAD: [u8; 4] = [0x10, 0x0E, 0x00, 0x00];
 
-/// Lidar spin-up: 65 frames at 20 ms = 1.3 s at PWM 100, matching the stock burst
-/// measured on 2026-10-01 (the firmware then settles to the nominal PWM).
-const LIDAR_SPINUP_FRAMES: u32 = 65;
+/// Lidar spin-up: 125 frames at 20 ms = 2.5 s at PWM 100.
+/// O motor só sai da inércia com 100% (medido na bancada em 01/10/2026: PWM 73 = 0 byte,
+/// PWM 100 = 8 KB/s). O instrumento cru parte o motor com 65 frames a 18 ms (1,2 s) usando
+/// a sequência correta; aqui fica 2,5 s para ter margem, porque o thread de heartbeat
+/// interleaveia frames e pode perturbar o pacing.
+const LIDAR_SPINUP_FRAMES: u32 = 125;
 /// PWM used during lidar spin-up (the stock firmware runs 100 before settling)
 const LIDAR_SPINUP_PWM: u8 = 100;
 /// Interval between spin-up frames, in milliseconds (matches the 50 Hz refresh)
@@ -79,6 +84,17 @@ const LIDAR_SPINUP_INTERVAL_MS: u64 = 20;
 /// The Delta-2D only restarts streaming after a real power cycle; 2 s was enough on
 /// the bench (toggling GPIO 233 for ~2 s brought the stream back at ~7.6 KB/s).
 const LIDAR_POWER_CYCLE_OFF_MS: u64 = 2000;
+
+/// How long to wait after powering the lidar rail back ON, before sending the
+/// prep/start burst (ms).
+///
+/// Measured on the bench (2026-10-01, `lidar_init_test` + GPIO 233 via sysfs):
+/// after a real power cycle, the prep/start burst sent immediately (< 1 s) does NOT
+/// wake the Delta-2D — 0 bytes on ttyS1 for 20 s straight. With ~10 s between
+/// power-on and the same burst, the sensor starts streaming at once (~3.7 KB in the
+/// first second, ~7.8 KB/s steady). So the sensor needs boot time before it accepts
+/// the start command. 12 s gives margin; the only cost is latency on the enable.
+const LIDAR_BOOT_MS: u64 = 12000;
 
 // ============================================================================
 // Component IDs
@@ -496,45 +512,55 @@ fn handle_lidar(
 
             log::debug!("Lidar enable (PWM={}% from config)", pwm);
 
-            // Measured on this unit (2026-10-01, bench test with the raw instrument):
-            // the Delta-2D only (re)starts streaming after a POWER CYCLE — asserting
-            // 0x97 01 on an already-powered unit does nothing (ttyS1 stayed silent for
-            // 30 s). Toggling the power rail and waiting ~2 s made it stream again at
-            // ~7.6 KB/s. The stock firmware also powers the lidar OFF (0x97 00) early in
-            // its startup, then ON ~5 s later — that cycle is what restarts the sensor.
-            // ORDER measured in the field capture:
-            //   0x97 00 (off) -> wait -> 0x97 01 (on) -> 0xA2 10 0E 00 00 (prep)
-            //   -> 0x65 02 (nav mode) -> 0x9D 01 -> 0x71 100 (spin-up ~1.3 s) -> 0x71 73
-            pkt.set_lidar_power(false);
-            send_packet(port, pkt)?;
-            std::thread::sleep(std::time::Duration::from_millis(LIDAR_POWER_CYCLE_OFF_MS));
-
-            pkt.set_lidar_power(true);
-            send_packet(port, pkt)?;
+            // SEQUENCIA COMPROVADA EM BANCADA (01/10/2026).
+            //
+            // A rajada atomica de fabrica (reproduzida aqui ate o build anterior) NAO parte
+            // o motor nesta unidade: medido, o daemon entregou ~58 pontos em 44 s enquanto o
+            // instrumento cru (`lidar_init_test`, mesma bancada, ttyS1 so para ele) entregou
+            // **1408 B/s sustentados por 20 s**. A diferenca esta na sequencia:
+            //
+            //   0x65 02 -> 0xA2 -> 0x97 01 -> 0x9D 01, com ~20 ms entre os frames
+            //   (o GD32 precisa desse intervalo para processar; o comentario de
+            //    MODE_SWITCH_DELAY_MS em heartbeat.rs ja dizia 100 ms apos o modo 0x02)
+            //   -> 1,2 s de 71 100 alternado com 66 (0,0) para sair da inercia
+            //   -> regime mantido pelo thread de heartbeat (71 <pwm> a 20 ms)
+            //
+            // O `0x97 00` NAO se manda: o ciclo do trilho (GPIO 233) e o GD32 quem faz.
+            log::info!(
+                "Lidar enable: sequencia de bancada (A2 antes do power, 20 ms entre frames, \
+                 spin-up 100% por ~1,2 s), PWM de regime {}%",
+                pwm
+            );
 
             pkt.set_motor_mode(0x02);
             send_packet(port, pkt)?;
+            thread::sleep(Duration::from_millis(20));
 
             pkt.set_imu_calibrate_state(&IMU_DEFAULT_PAYLOAD);
             send_packet(port, pkt)?;
+            thread::sleep(Duration::from_millis(20));
+
+            pkt.set_lidar_power(true);
+            send_packet(port, pkt)?;
+            thread::sleep(Duration::from_millis(20));
 
             pkt.set_lidar_start();
             send_packet(port, pkt)?;
+            thread::sleep(Duration::from_millis(20));
 
-            // Spin-up at 100%. Done here rather than through the heartbeat because
-            // `lidar_enabled` is still false, so the 20 ms refresh cannot overwrite it
-            // with the nominal PWM. send_packet() takes the port lock per call, so the
-            // heartbeat and reader threads keep running between frames.
             for _ in 0..LIDAR_SPINUP_FRAMES {
                 pkt.set_lidar_pwm(LIDAR_SPINUP_PWM);
                 send_packet(port, pkt)?;
-                std::thread::sleep(std::time::Duration::from_millis(LIDAR_SPINUP_INTERVAL_MS));
+                pkt.set_velocity(0, 0);
+                send_packet(port, pkt)?;
+                thread::sleep(Duration::from_millis(LIDAR_SPINUP_INTERVAL_MS));
             }
+            log::info!("Lidar spin-up concluido (PWM {}%)", LIDAR_SPINUP_PWM);
 
-            // Enable lidar
+            // Ligado: o thread de heartbeat passa a refrescar o `0x71` a 20 ms, como a
+            // fabrica faz a ~50 Hz. O GD32 devolve o trilho ~2,2 s depois, por conta dele.
             component_state.lidar_enabled.store(true, Ordering::Relaxed);
 
-            // Send initial PWM command at the nominal value from config
             pkt.set_lidar_pwm(pwm);
             send_packet(port, pkt)?;
 
