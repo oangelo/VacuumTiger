@@ -49,11 +49,21 @@ use std::sync::{Arc, Mutex};
 // Constants
 // ============================================================================
 
-/// Conversion factor from m/s or rad/s to GD32 velocity units.
+/// Conversion factor from linear velocity (m/s) to GD32 velocity units.
 ///
-/// Empirically calibrated: commanded 0.35 rad/s resulted in 0.669 rad/s actual,
-/// so the correction factor is 1000 / 1.91 ≈ 523.
-const VELOCITY_TO_DEVICE_UNITS: f32 = 523.0;
+/// Measured on this unit with a tape (2026-09-30): the stock firmware commanded
+/// **863 units** and the robot covered 1.02 m and 3.04 m in two runs that agreed
+/// within 2.5%, i.e. 19.25 cm/s -> 1 unit ≈ 0.223 mm/s -> **4483 units per m/s**.
+/// The old single constant (523) came from a single angular observation and was
+/// applied to linear too, making every linear command ~8.6x slower than requested.
+const LINEAR_UNITS_PER_MPS: f32 = 4483.0;
+
+/// Conversion factor from angular velocity (rad/s) to GD32 velocity units.
+///
+/// Upstream single observation: commanded 0.35 rad/s produced 0.669 rad/s actual.
+/// **Not verified on this unit yet** — Fase 2 measures it against the odometry
+/// before this value changes. Do not "fix" it by guessing.
+const ANGULAR_UNITS_PER_RADS: f32 = 523.0;
 
 /// Default IMU calibration payload observed in R2D logs
 const IMU_DEFAULT_PAYLOAD: [u8; 4] = [0x10, 0x0E, 0x00, 0x00];
@@ -397,8 +407,8 @@ fn handle_drive(
             if let (Some(SensorValue::F32(linear)), Some(SensorValue::F32(angular))) =
                 (config.get("linear"), config.get("angular"))
             {
-                let linear_units = (linear * VELOCITY_TO_DEVICE_UNITS) as i16;
-                let angular_units = (angular * VELOCITY_TO_DEVICE_UNITS) as i16;
+                let linear_units = (linear * LINEAR_UNITS_PER_MPS) as i16;
+                let angular_units = (angular * ANGULAR_UNITS_PER_RADS) as i16;
                 // Store velocity for heartbeat to send continuously
                 component_state
                     .linear_velocity
@@ -420,8 +430,8 @@ fn handle_drive(
             if let (Some(SensorValue::F32(left)), Some(SensorValue::F32(right))) =
                 (config.get("left"), config.get("right"))
             {
-                let left_units = (left * VELOCITY_TO_DEVICE_UNITS) as i16;
-                let right_units = (right * VELOCITY_TO_DEVICE_UNITS) as i16;
+                let left_units = (left * LINEAR_UNITS_PER_MPS) as i16;
+                let right_units = (right * LINEAR_UNITS_PER_MPS) as i16;
                 log::debug!(
                     "Drive tank: left={:.3} m/s ({} units), right={:.3} m/s ({} units)",
                     left,

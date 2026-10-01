@@ -83,7 +83,8 @@ impl TxPacket {
     ///
     /// Linear: forward/backward speed (empirical units, positive = forward)
     /// Angular: rotation speed (empirical units, positive = counter-clockwise)
-    /// Note: Units are converted from m/s and rad/s using VELOCITY_TO_DEVICE_UNITS (523)
+    /// Note: units arrive in m/s and rad/s and are converted with LINEAR_UNITS_PER_MPS
+    /// (4483, tape-measured) and ANGULAR_UNITS_PER_RADS (523, upstream, unverified).
     #[inline]
     pub fn set_velocity(&mut self, linear: i16, angular: i16) {
         self.data[2] = 11; // LEN = cmd(1) + payload(8) + crc(2)
