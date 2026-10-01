@@ -31,6 +31,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const REAL_PORT: &str = "/dev/ttyS3_hardware";
 const VIRTUAL_PORT: &str = "/tmp/ttyS3_tap";
+
+/// Resolve a path from the environment, falling back to the given default.
+/// Used to capture a second UART in parallel (e.g. the lidar link):
+///   MITM_REAL_PORT=/dev/ttyS1_hardware MITM_TAP=/tmp/ttyS1_tap MITM_TAG=ttyS1
+fn path_from_env(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
 const LOG_DIR: &str = "/tmp"; // Use RAM instead of flash to avoid write latency
 const RUN_COUNTER_FILE: &str = "/mnt/UDISK/mitm_run_counter";
 const GPIO_233_VALUE: &str = "/sys/class/gpio/gpio233/value";
@@ -60,7 +67,26 @@ fn log_packet(log: &mut File, direction: &str, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn configure_serial(fd: RawFd) -> io::Result<()> {
+fn baud_to_speed(b: u32) -> io::Result<libc::speed_t> {
+    Ok(match b {
+        9600 => libc::B9600,
+        19200 => libc::B19200,
+        38400 => libc::B38400,
+        57600 => libc::B57600,
+        115200 => libc::B115200,
+        230400 => libc::B230400,
+        460800 => libc::B460800,
+        921600 => libc::B921600,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("baud nao suportado: {}", b),
+            ))
+        }
+    })
+}
+
+fn configure_serial(fd: RawFd, baud: u32) -> io::Result<()> {
     unsafe {
         let mut termios: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut termios) != 0 {
@@ -70,9 +96,10 @@ fn configure_serial(fd: RawFd) -> io::Result<()> {
         // Raw mode
         libc::cfmakeraw(&mut termios);
 
-        // 115200 baud
-        libc::cfsetispeed(&mut termios, libc::B115200);
-        libc::cfsetospeed(&mut termios, libc::B115200);
+        // Baud configurable (default 115200) - ver MITM_BAUD
+        let speed = baud_to_speed(baud)?;
+        libc::cfsetispeed(&mut termios, speed);
+        libc::cfsetospeed(&mut termios, speed);
 
         // 8N1
         termios.c_cflag &= !libc::PARENB; // No parity
@@ -134,6 +161,21 @@ fn create_pty() -> io::Result<(RawFd, String)> {
         libc::close(slave);
 
         Ok((master, slave_name))
+    }
+}
+
+/// Coloca um fd em modo non-blocking.
+///
+/// CRITICO para o lado do sensor: o loop do proxy le o PTY antes do hardware e,
+/// sem O_NONBLOCK, o read() bloqueia quando o host do robo fica quieto. Numa UART
+/// so-leitura (LiDAR: o host nunca transmite, so le) isso travaria o proxy para
+/// sempre e o hardware nunca seria lido.
+fn set_nonblocking(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 }
 
@@ -209,8 +251,12 @@ fn main() -> io::Result<()> {
 
     println!("========================================");
     println!("  Serial MITM Logger - GD32 Protocol");
+    let real_port = path_from_env("MITM_REAL_PORT", REAL_PORT);
+    let virtual_port = path_from_env("MITM_TAP", VIRTUAL_PORT);
+    let tag = std::env::var("MITM_TAG").ok();
+
     println!("  Run: {}", run_number);
-    println!("  Real port: {}", REAL_PORT);
+    println!("  Real port: {}", real_port);
     println!("========================================\n");
 
     // Create log directory if it doesn't exist
@@ -218,10 +264,16 @@ fn main() -> io::Result<()> {
 
     // Generate log filename with timestamp and run number
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let log_filename = format!(
-        "{}/mitm_capture_run{}_{}.log",
-        LOG_DIR, run_number, timestamp
-    );
+    let log_filename = match tag.as_deref() {
+        Some(t) => format!(
+            "{}/mitm_capture_{}_run{}_{}.log",
+            LOG_DIR, t, run_number, timestamp
+        ),
+        None => format!(
+            "{}/mitm_capture_run{}_{}.log",
+            LOG_DIR, run_number, timestamp
+        ),
+    };
     println!("Log file: {}\n", log_filename);
 
     // Open log file (wrapped in Arc<Mutex<>> for sharing with GPIO thread)
@@ -251,28 +303,36 @@ fn main() -> io::Result<()> {
     println!("✓ GPIO monitoring active");
 
     // Open real serial port
-    println!("Opening real serial port {}...", REAL_PORT);
-    let real_serial = OpenOptions::new().read(true).write(true).open(REAL_PORT)?;
+    println!("Opening real serial port {}...", real_port);
+    let real_serial = OpenOptions::new().read(true).write(true).open(&real_port)?;
+
+    let baud: u32 = std::env::var("MITM_BAUD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(115200);
 
     let real_fd = real_serial.as_raw_fd();
-    configure_serial(real_fd)?;
+    set_nonblocking(real_fd);
+    configure_serial(real_fd, baud)?;
+    println!("✓ Real port opened and configured ({} baud)", baud);
     println!("✓ Real port opened and configured");
 
     // Create pseudo-terminal
     println!("Creating virtual serial port...");
     let (pty_master, pty_slave_name) = create_pty()?;
+    set_nonblocking(pty_master);
     // NOTE: Do NOT configure PTY master with termios - leave it in default state
     // AuxCtrl will configure the slave side as it expects a serial port
     println!("✓ Virtual port created at: {}", pty_slave_name);
 
     // Create symlink
-    println!("Creating symlink {} -> {}", VIRTUAL_PORT, pty_slave_name);
-    let _ = std::fs::remove_file(VIRTUAL_PORT);
-    std::os::unix::fs::symlink(&pty_slave_name, VIRTUAL_PORT)?;
+    println!("Creating symlink {} -> {}", virtual_port, pty_slave_name);
+    let _ = std::fs::remove_file(&virtual_port);
+    std::os::unix::fs::symlink(&pty_slave_name, &virtual_port)?;
     println!("✓ Symlink created");
 
     println!("\nMITM proxy is running!");
-    println!("AuxCtrl will connect to {} (redirected)", VIRTUAL_PORT);
+    println!("AuxCtrl will connect to {} (redirected)", virtual_port);
     println!(
         "Send SIGTERM (kill {}) or Ctrl+C to stop gracefully\n",
         unsafe { libc::getpid() }
@@ -372,7 +432,7 @@ fn main() -> io::Result<()> {
         libc::close(pty_master);
         libc::close(real_fd);
     }
-    let _ = std::fs::remove_file(VIRTUAL_PORT);
+    let _ = std::fs::remove_file(&virtual_port);
 
     println!("✓ MITM proxy stopped cleanly\n");
 
