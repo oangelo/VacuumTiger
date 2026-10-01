@@ -353,14 +353,29 @@ impl Delta2DPacketReader {
             return Ok(LidarScan { points });
         }
 
-        // Byte 0: Motor speed indicator (ignored)
-        // Bytes 1-2: Offset angle (angle increment between points) (BE) * 0.01 degrees
-        // Bytes 3-4: Start angle (BE) * 0.01 degrees
-        let offset_angle_raw = ((payload[1] as u16) << 8) | (payload[2] as u16);
+        // Layout medido na captura de fábrica de 01/10/2026 (67.064 pacotes 0xAD,
+        // 4.192 voltas), com validação geométrica (paredes com RMS de 7,8 mm):
+        //
+        //   payload[0]   = indicador de velocidade do motor (0x80/0x81) — ignorado
+        //   payload[1:3] = constante 0x000A — NÃO é o incremento de ângulo
+        //                  (era assim que este driver lia: dava 0,1°/ponto e
+        //                  destruía a geometria da varredura)
+        //   payload[3:5] = ângulo inicial do pacote, BE, em 0,01°; 0..33750 e
+        //                  reinicia a cada volta -> SEMPRE 16 pacotes por volta,
+        //                  espaçados exatamente 22,5° (2250 unidades)
+        //   payload[5:]  = n pontos de 3 bytes (quality, distance BE, 0,25 mm/LSB),
+        //                  n = 18, 19 ou 20
+        //
+        // O sensor amostra em base de tempo fixa (~485 µs por ponto, medido: o
+        // intervalo entre pacotes é proporcional a n) e corta o pacote na fronteira
+        // da janela de 22,5°, então o passo angular por ponto é 22.5 / n.
         let start_angle_raw = ((payload[3] as u16) << 8) | (payload[4] as u16);
-
-        // Convert offset angle to degrees (angle increment between consecutive points)
-        let angle_increment_deg = offset_angle_raw as f32 * 0.01;
+        let start_angle_deg = start_angle_raw as f32 * 0.01;
+        let point_count = (payload.len() - 5) / 3;
+        if point_count == 0 {
+            return Ok(LidarScan { points });
+        }
+        let angle_increment_deg = 22.5 / point_count as f32;
 
         // Parse measurement points (3 bytes each)
         let mut i = 5;
@@ -371,10 +386,13 @@ impl Delta2DPacketReader {
             let distance_raw = ((payload[i + 1] as u16) << 8) | (payload[i + 2] as u16);
 
             // Convert to physical units
-            // Angle: start_angle + (point_index * angle_increment)
+            // Angle: start_angle + (point_index * increment), dentro de [0, 360)
             // Distance: raw * 0.25mm = raw * 0.00025m
-            let angle_deg =
-                (start_angle_raw as f32 * 0.01) + (point_index as f32 * angle_increment_deg);
+            let mut angle_deg =
+                start_angle_deg + (point_index as f32 * angle_increment_deg);
+            while angle_deg >= 360.0 {
+                angle_deg -= 360.0;
+            }
             let raw_angle_rad = angle_deg.to_radians();
             let distance_m = distance_raw as f32 * 0.00025;
 
@@ -390,8 +408,7 @@ impl Delta2DPacketReader {
             }
 
             // Only add valid points (distance > 0, quality > 0)
-            // Also validate angle range
-            if distance_raw > 0 && quality > 0 && (0.0..=360.0).contains(&angle_deg) {
+            if distance_raw > 0 && quality > 0 {
                 points.push(LidarPoint {
                     angle: angle_rad,
                     distance: distance_m,
@@ -431,6 +448,63 @@ mod tests {
         reader.buffer.push((sum & 0xFF) as u8);
 
         assert!(reader.validate_crc(12));
+    }
+
+    #[test]
+    fn test_measurement_angle_layout() {
+        // Pacote sintético com o layout medido na captura de 01/10/2026:
+        // 20 pontos, angulo inicial 2250 (=22,5 graus), passo 22,5/20 = 1,125 graus.
+        let mut payload = vec![0x80, 0x00, 0x0A, 0x08, 0xCA];
+        for _ in 0..20 {
+            payload.push(100); // quality
+            payload.push(0x00); // distancia BE = 100 -> 25 mm
+            payload.push(0x64);
+        }
+        let reader = Delta2DPacketReader::with_transform(AffineTransform1D::identity());
+        let scan = reader.parse_measurement(&payload).unwrap();
+        assert_eq!(scan.points.len(), 20);
+        for (i, p) in scan.points.iter().enumerate() {
+            let expected = (22.5 + i as f32 * 1.125).to_radians();
+            assert!(
+                (p.angle - expected).abs() < 1e-5,
+                "ponto {i}: {} != {expected}",
+                p.angle
+            );
+            assert!((p.distance - 0.025).abs() < 1e-6);
+        }
+
+        // Com 18 pontos o passo tem que ser 22,5/18 = 1,25 graus (o sensor corta o
+        // pacote na janela de 22,5 graus, nao em incremento fixo).
+        let mut payload18 = vec![0x81, 0x00, 0x0A, 0x00, 0x00];
+        for _ in 0..18 {
+            payload18.push(80);
+            payload18.push(0x01);
+            payload18.push(0x00);
+        }
+        let scan18 = reader.parse_measurement(&payload18).unwrap();
+        assert_eq!(scan18.points.len(), 18);
+        let expected_last = (17.0f32 * 1.25).to_radians();
+        assert!((scan18.points[17].angle - expected_last).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_measurement_ignores_constant_field() {
+        // payload[1:3] = 0x000A e constante e NAO pode virar incremento de angulo:
+        // dois pacotes com o mesmo angulo inicial tem que dar os mesmos angulos.
+        let mut a = vec![0x80, 0x00, 0x0A, 0x00, 0x00];
+        let mut b = vec![0x80, 0x00, 0x0A, 0x00, 0x00];
+        for _ in 0..19 {
+            a.extend_from_slice(&[90, 0x02, 0x00]);
+            b.extend_from_slice(&[90, 0x02, 0x00]);
+        }
+        let reader = Delta2DPacketReader::with_transform(AffineTransform1D::identity());
+        let sa = reader.parse_measurement(&a).unwrap();
+        let sb = reader.parse_measurement(&b).unwrap();
+        assert_eq!(sa.points.len(), 19);
+        assert_eq!(sb.points.len(), 19);
+        assert!((sa.points[5].angle - sb.points[5].angle).abs() < 1e-9);
+        // passo 22,5/19
+        assert!((sa.points[1].angle - (22.5f32 / 19.0).to_radians()).abs() < 1e-5);
     }
 
     #[test]

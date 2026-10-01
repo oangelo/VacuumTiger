@@ -140,6 +140,17 @@ struct LidarReport {
     bytes_discarded: u64,
     bytes_total: u64,
     points_per_packet: BTreeMap<usize, u64>,
+    /// Passos de ângulo que andam para trás (o normal: a transform do CRL-200S
+    /// espelha, então a varredura decresce dentro da volta).
+    steps_down: u64,
+    /// Passos pequenos para a frente — é o sintoma do bug antigo (incremento de
+    /// 0,1°/ponto deixava a varredura quase parada e "pulando" para frente).
+    steps_up_small: u64,
+    /// Passos grandes para a frente = fronteira de volta (wrap de 360°).
+    wraps: u64,
+    /// Menor/maior passo angular entre pontos consecutivos, em graus.
+    min_step_deg: f32,
+    max_step_deg: f32,
 }
 
 fn replay_lidar(path: &str) -> std::io::Result<(LidarReport, f64)> {
@@ -169,11 +180,31 @@ fn replay_lidar(path: &str) -> std::io::Result<(LidarReport, f64)> {
                     *report.points_per_packet.entry(scan.points.len()).or_default() += 1;
 
                     for point in &scan.points {
-                        if point.angle - ultimo_angulo > std::f32::consts::PI
-                            && acumulados > MIN_SCAN_POINTS
-                        {
-                            report.revolutions += 1;
-                            acumulados = 0;
+                        if report.accepted_points > 0 {
+                            let diff = point.angle - ultimo_angulo;
+                            if diff > std::f32::consts::PI {
+                                if acumulados > MIN_SCAN_POINTS {
+                                    // fronteira de volta: é aqui que o driver publica a varredura
+                                    report.revolutions += 1;
+                                    report.wraps += 1;
+                                    acumulados = 0;
+                                } else {
+                                    report.steps_up_small += 1;
+                                }
+                            } else if diff < 0.0 {
+                                report.steps_down += 1;
+                            } else {
+                                report.steps_up_small += 1;
+                            }
+                            if diff.abs() <= std::f32::consts::PI {
+                                let deg = diff.abs().to_degrees();
+                                if report.min_step_deg == 0.0 || deg < report.min_step_deg {
+                                    report.min_step_deg = deg;
+                                }
+                                if deg > report.max_step_deg {
+                                    report.max_step_deg = deg;
+                                }
+                            }
                         }
                         acumulados += 1;
                         report.accepted_points += 1;
@@ -326,6 +357,18 @@ fn main() -> ExitCode {
         .map(|(k, v)| format!("{k}p:{v}"))
         .collect();
     println!("  pontos/pacote      {}", hist.join("  "));
+    let total_steps = lidar.steps_down + lidar.steps_up_small;
+    println!(
+        "  monotonicidade     {} p/ tras, {} p/ frente em {} passos ({:.2}% p/ tras)",
+        lidar.steps_down,
+        lidar.steps_up_small,
+        total_steps,
+        100.0 * lidar.steps_down as f64 / total_steps.max(1) as f64
+    );
+    println!(
+        "  passo angular      {:.3} .. {:.3} graus  (esperado ~1,1-1,3)",
+        lidar.min_step_deg, lidar.max_step_deg
+    );
 
     let (gd32, gd32_span) = match replay_gd32(&args[1]) {
         Ok(v) => v,
