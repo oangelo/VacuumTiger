@@ -379,6 +379,10 @@ fn handle_drive(
     pkt: &mut TxPacket,
     action: &ComponentAction,
 ) -> Result<()> {
+    // Any drive command (enable, velocity, disable) re-arms the dead-man:
+    // a fresh command resets the staleness timer, so a healthy client stays
+    // ahead of the timeout and is never stopped mid-move.
+    component_state.note_drive_command();
     match action {
         ComponentAction::Enable { config } => {
             // Enable motor with mode (default 0x02 nav mode)

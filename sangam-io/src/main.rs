@@ -9,7 +9,7 @@
 //! for UDP sensor streaming. This eliminates network flooding from broadcasts.
 
 use sangam_io::config::Config;
-use sangam_io::core::types::Command;
+use sangam_io::core::types::{Command, ComponentAction};
 use sangam_io::devices::create_device;
 use sangam_io::error::{Error, Result};
 use sangam_io::streaming::{TcpReceiver, UdpClientRegistry, UdpPublisher, create_serializer};
@@ -204,6 +204,7 @@ fn main() -> Result<()> {
 
                 // Clone resources for receiver thread
                 let driver_clone = Arc::clone(&driver);
+                let deadman_driver = Arc::clone(&driver);
                 let recv_serializer = create_serializer();
                 let recv_running = Arc::clone(&running);
                 let registry_clone = Arc::clone(&udp_client_registry);
@@ -224,6 +225,20 @@ fn main() -> Result<()> {
                             log::error!("TCP receiver error: {}", e);
                         }
                         log::info!("TCP client disconnected: {}", addr);
+
+                        // Dead-man (deterministic): o TCP caiu (cliente morto,
+                        // kill, rede) - zera e desabilita o drive AGORA, sem
+                        // esperar o timeout do heartbeat. O GD32 mantem a ultima
+                        // velocidade; sem isto o robo continua andando.
+                        // (O heartbeat ainda tem o dead-man por presta como rede
+                        // de seguranca para o caso de conexao meia-viva.)
+                        {
+                            let mut drv = deadman_driver.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = drv.send_command(Command::ComponentControl {
+                                id: "drive".to_string(),
+                                action: ComponentAction::Disable { config: None },
+                            });
+                        }
 
                         // Unregister client from UDP streaming
                         if let Ok(mut guard) = registry_clone.lock() {

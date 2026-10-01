@@ -334,6 +334,20 @@ pub struct HardwareConfig {
     /// **CRITICAL**: Values outside 20-50ms will cause motors to stop!
     pub heartbeat_interval_ms: u64,
 
+    /// Dead-man switch timeout for the wheel motors, in milliseconds.
+    ///
+    /// The GD32 holds the last commanded velocity indefinitely (no hardware
+    /// watchdog — measured 01/10/2026). If a drive (velocity/enable) command
+    /// is not received within this window while the robot is moving, the
+    /// heartbeat zeroes the motors and exits navigation mode.
+    ///
+    /// **Default**: 3000ms — safe for clients that re-issue velocity every
+    /// segment (e.g. `map-drive.py` refreshes every 1.2-2s). A closed-loop
+    /// controller streaming at 20-50Hz may lower this to ~500ms; raise it only
+    /// if a legitimate client legitimately holds a velocity for longer.
+    #[serde(default = "default_deadman_timeout_ms")]
+    pub deadman_timeout_ms: u64,
+
     /// Coordinate frame transforms for sensor data
     ///
     /// Transforms raw sensor data to ROS REP-103 robot frame.
@@ -367,6 +381,11 @@ pub struct HardwareConfig {
 
 fn default_lidar_pwm() -> u8 {
     60
+}
+
+/// Default dead-man switch timeout for wheel motors (see `deadman_timeout_ms`).
+fn default_deadman_timeout_ms() -> u64 {
+    3000
 }
 
 /// Roborock S5 Max hardware configuration.

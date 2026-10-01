@@ -37,6 +37,13 @@ heartbeat_interval_ms = 20
 # The upstream default of 60 was an estimate; 73 is the observed value.
 lidar_pwm = 73
 
+# Dead-man switch timeout for the wheel motors (ms).
+# The GD32 holds the last commanded velocity indefinitely (no hardware watchdog).
+# The daemon stops the motors if no drive command arrives within this window while
+# the robot is moving. Default 3000; lower (e.g. 500) once a closed-loop controller
+# streams velocity at 20-50Hz. See src/devices/crl200s/gd32/heartbeat.rs.
+deadman_timeout_ms = 3000
+
 # Lidar mounting configuration
 # Defines the physical mounting position of the lidar relative to robot center.
 # SangamIO uses this to transform lidar measurements to robot-centered coordinates

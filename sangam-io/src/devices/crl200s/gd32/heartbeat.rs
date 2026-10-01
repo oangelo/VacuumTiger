@@ -149,12 +149,49 @@ pub(super) fn heartbeat_loop(
         }
 
         if component_state.motor_mode_set.load(Ordering::Relaxed) {
-            // NAO reenviar 0x65 02 a cada ciclo: medido em bancada (01/10/2026) com o
-            // instrumento `lidar_init_test`, mesma ordem de start e mesmo PWM:
-            //   regime [0x66 + 0x71]      -> 8.000 B/s no ttyS1 (motor rodando)
-            //   regime [0x65 02 + 0x71]   -> 0 byte, motor PARA e nao volta na sessao
-            // A fabrica manda o 0x65 02 UMA vez (esta no burst de start) e depois so
-            // 0x66 a ~50 Hz + 0x71. O modo 0x02 fica latcheado no GD32.
+            // NAO reenviar 0x65 02 a cada ciclo ... (comentario acima)
+
+            // =========================================================
+            // DEAD-MAN SWITCH
+            // =========================================================
+            // O GD32 mantem a ultima velocidade sem heartbeat (medido em
+            // 01/10/2026: `kill -9` no daemon e o robo andou ~1,03 m). O TCP
+            // cair (cliente morto/rede) NAO `p por si so` - o daemon continua
+            // reenviando a ultima velocidade. Aqui, se ha velocidade != 0 e
+            // nenhum comando de drive chegou em `deadman_timeout_ms`, fazemos
+            // a parada explicita (0,0 + modo 0x00), como manda a seguranca.
+            if component_state.deadman_expired() {
+                if !component_state.deadman_tripped.load(Ordering::Relaxed) {
+                    log::warn!(
+                        "DEAD-MAN: sem comando de drive por >={}ms - parando motor (velocidade estava {:?})",
+                        component_state.deadman_timeout_ms.load(Ordering::Relaxed),
+                        component_state.get_velocities()
+                    );
+                    component_state.deadman_tripped.store(true, Ordering::Relaxed);
+                }
+                // Sto explicita: zera estado -> envia 0,0 -> sai do modo 0x02.
+                component_state.linear_velocity.store(0, Ordering::Relaxed);
+                component_state.angular_velocity.store(0, Ordering::Relaxed);
+                component_state.wheel_motor_enabled.store(false, Ordering::Relaxed);
+                pkt.set_velocity(0, 0);
+                if let Err(e) = pkt.send_to(&mut *port) {
+                    log::error!("Dead-man stop velocity send failed: {}", e);
+                }
+                pkt.set_motor_mode(0x00);
+                if let Err(e) = pkt.send_to(&mut *port) {
+                    log::error!("Dead-man stop mode send failed: {}", e);
+                }
+                component_state
+                    .motor_mode_set
+                    .store(false, Ordering::Relaxed);
+                // Dorme e volta ao topo. O proximo comando de drive de um
+                // cliente novo rearma (`note_drive_command`); se o lidar estiver
+                // ligado, `any_component_active` re-seta o modo 0x02 no ciclo
+                // seguinte, mas com velocidade 0 o robo permanece parado.
+                drop(port);
+                thread::sleep(Duration::from_millis(interval_ms));
+                continue;
+            }
 
             // Motor mode 0x02 active - send velocity command as heartbeat
             pkt.set_velocity(linear, angular);

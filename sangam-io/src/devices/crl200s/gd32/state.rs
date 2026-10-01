@@ -3,7 +3,22 @@
 //! This module defines the shared state used by the heartbeat thread to refresh
 //! component commands every 20ms. All fields use atomic types to allow lockless reads.
 
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
+
+/// Epoch instant for the monotonic clock used by the dead-man switch.
+///
+/// Stored once at process start; all "last command" timestamps are offsets from
+/// this instant, so they are only meaningful within one process run. Monotonic
+/// (not wall-clock), so unaffected by NTP/realtime jumps.
+static DEADMAN_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// Monotonic timestamp in milliseconds since process start.
+fn monotonic_ms() -> u64 {
+    let epoch = *DEADMAN_EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_millis() as u64
+}
 
 /// Default lidar PWM (60% gives ~330 RPM / 5.5Hz scan rate)
 const DEFAULT_LIDAR_PWM: u8 = 60;
@@ -36,11 +51,21 @@ pub struct ComponentState {
     pub linear_velocity: AtomicI16,
     pub angular_velocity: AtomicI16,
     pub wheel_motor_enabled: AtomicBool,
+    /// Monotonic ms of the last drive (velocity/disable/enable) command received
+    /// over TCP. The dead-man switch uses this to detect a lost/stuck client
+    /// (the GD32 holds the last commanded velocity forever without heartbeat).
+    pub last_drive_cmd_ms: AtomicU64,
+    /// Dead-man timeout in ms. If velocity is non-zero and no drive command
+    /// arrives within this window, the heartbeat zeroes the motors.
+    pub deadman_timeout_ms: AtomicU64,
+    /// Whether the dead-man tripped (for observability only - the stop itself
+    /// is performed by the heartbeat once it sees the staleness).
+    pub deadman_tripped: AtomicBool,
 }
 
 impl ComponentState {
     /// Create a new ComponentState with custom initial lidar PWM
-    pub fn new(lidar_pwm: u8) -> Self {
+    pub fn new(lidar_pwm: u8, deadman_timeout_ms: u64) -> Self {
         Self {
             vacuum: AtomicU8::new(0),
             main_brush: AtomicU8::new(0),
@@ -52,7 +77,34 @@ impl ComponentState {
             linear_velocity: AtomicI16::new(0),
             angular_velocity: AtomicI16::new(0),
             wheel_motor_enabled: AtomicBool::new(false),
+            last_drive_cmd_ms: AtomicU64::new(0),
+            deadman_timeout_ms: AtomicU64::new(deadman_timeout_ms.max(100)),
+            deadman_tripped: AtomicBool::new(false),
         }
+    }
+
+    /// Record that a drive command was received (arms the dead-man's freshness
+    /// check). Called on every enable / velocity configure / disable.
+    pub fn note_drive_command(&self) {
+        self.last_drive_cmd_ms.store(monotonic_ms(), Ordering::Relaxed);
+        // A new command implicitly clears any prior trip, so a healthy client
+        // re-continues cleanly after reconnecting.
+        self.deadman_tripped.store(false, Ordering::Relaxed);
+    }
+
+    /// True when the robot is being told to move (velocity non-zero) and no
+    /// drive command has arrived within the dead-man window. When the client is
+    /// dead/stuck this is the signal to stop.
+    pub fn deadman_expired(&self) -> bool {
+        let (lin, ang) = self.get_velocities();
+        if lin == 0 && ang == 0 {
+            return false; // idle: nothing to stop
+        }
+        let now = monotonic_ms();
+        let last = self.last_drive_cmd_ms.load(Ordering::Relaxed);
+        let timeout = self.deadman_timeout_ms.load(Ordering::Relaxed);
+        // `last` is 0 only before any command; treat as armed (no freshness).
+        now.saturating_sub(last) >= timeout
     }
 
     /// Clear all component states (used by emergency stop)
@@ -67,6 +119,8 @@ impl ComponentState {
         self.angular_velocity.store(0, Ordering::Relaxed);
         self.wheel_motor_enabled.store(false, Ordering::Relaxed);
         self.motor_mode_set.store(false, Ordering::Relaxed);
+        self.last_drive_cmd_ms.store(monotonic_ms(), Ordering::Relaxed);
+        self.deadman_tripped.store(false, Ordering::Relaxed);
     }
 
     /// Check if any component is active (determines if motor mode 0x02 is needed)
@@ -105,6 +159,70 @@ impl ComponentState {
 
 impl Default for ComponentState {
     fn default() -> Self {
-        Self::new(DEFAULT_LIDAR_PWM)
+        Self::new(DEFAULT_LIDAR_PWM, 3000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn deadman_idle_never_trips() {
+        // Velocity 0,0 -> dead-man inerte: nunca deve cair, por mais tempo que
+        // passe sem comando.
+        let s = ComponentState::new(DEFAULT_LIDAR_PWM, 50);
+        s.note_drive_command();
+        s.linear_velocity.store(0, Ordering::Relaxed);
+        s.angular_velocity.store(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!s.deadman_expired(), "idle com velocidade 0 nao deve expirar");
+    }
+
+    #[test]
+    fn deadman_moving_without_command_trips() {
+        let s = ComponentState::new(DEFAULT_LIDAR_PWM, 100);
+        s.note_drive_command();
+        s.linear_velocity.store(4483, Ordering::Relaxed); // ~1 m/s em unidades
+        s.angular_velocity.store(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(160)); // > timeout (100ms)
+        assert!(
+            s.deadman_expired(),
+            "movendo sem comando novo deve expirar apos o timeout"
+        );
+    }
+
+    #[test]
+    fn deadman_command_refresh_keeps_alive() {
+        let s = ComponentState::new(DEFAULT_LIDAR_PWM, 100);
+        s.linear_velocity.store(4483, Ordering::Relaxed);
+        // Cliente saudavel reenvia antes do timeout -> nunca expira.
+        for _ in 0..10 {
+            s.note_drive_command();
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                !s.deadman_expired(),
+                "vontade de comando (refresco) nao deve expirar"
+            );
+        }
+    }
+
+    #[test]
+    fn note_drive_command_clears_prior_trip() {
+        let s = ComponentState::new(DEFAULT_LIDAR_PWM, 100);
+        s.linear_velocity.store(4483, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(160));
+        assert!(s.deadman_expired());
+        // Novo comando (reconexao de cliente) rearma e limpa o trip.
+        s.note_drive_command();
+        assert!(!s.deadman_expired());
+        assert!(!s.deadman_tripped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn default_timeout_clamped_to_minimum() {
+        let s = ComponentState::new(DEFAULT_LIDAR_PWM, 10); // abaixo do minimo
+        assert_eq!(s.deadman_timeout_ms.load(Ordering::Relaxed), 100);
     }
 }

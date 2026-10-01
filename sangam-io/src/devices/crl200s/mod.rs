@@ -113,6 +113,7 @@ impl DeviceDriver for CRL200SDriver {
             &hardware.gd32_port,
             hardware.heartbeat_interval_ms,
             hardware.lidar_pwm,
+            hardware.deadman_timeout_ms,
         )?;
 
         // Send initialization sequence
