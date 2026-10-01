@@ -125,8 +125,10 @@ pub struct LidarData {
     pub points: Vec<LidarPoint>,
 }
 
-/// Channel capacity for sensor data (small to avoid buffering old data).
-const SENSOR_CHANNEL_CAPACITY: usize = 8;
+/// Channel capacity for sensor data. Era 8: com o sensor a ~323Hz e o SLAM thread
+/// ocupado no scan matching, o canal enchia e o try_send do receiver DROPAVA a
+/// odometria (odom_delta ~0). Subido bastante p/ absorver o burst sem perder.
+const SENSOR_CHANNEL_CAPACITY: usize = 256;
 
 /// Channel capacity for lidar data.
 const LIDAR_CHANNEL_CAPACITY: usize = 4;

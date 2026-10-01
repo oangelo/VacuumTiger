@@ -157,6 +157,13 @@ fn run_live_loop(
             recv(sensor_rx) -> result => {
                 if let Ok(sensor_data) = result {
                     slam_context.process_udp_sensor_status(&sensor_data, &shared_state);
+                    // Drain o resto do canal: o sensor chega a ~323Hz mas o SLAM
+                    // thread so consome UM por iteracao -> se sobra canal cheio o
+                    // receiver (try_send bounded=8) DROPA quase tudo e a odometria
+                    // some (odom_delta ~0 no giro). Processar todos os que chegaram.
+                    while let Ok(more) = sensor_rx.try_recv() {
+                        slam_context.process_udp_sensor_status(&more, &shared_state);
+                    }
                 }
             }
             recv(lidar_rx) -> result => {
@@ -430,6 +437,15 @@ impl SlamContext {
     ) {
         // Update odometry
         if let Some(odom_pose) = self.odometry.update(left, right, gyro_yaw, timestamp_us) {
+            static ODOM_LOG_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let c = ODOM_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c % 200 == 0 {
+                log::debug!(
+                    "[odom] left={} right={} gyro={} -> pose=({:.3},{:.3},{:.1}°)",
+                    left, right, gyro_yaw, odom_pose.x, odom_pose.y, odom_pose.theta.to_degrees()
+                );
+            }
             // odom_pose e' o DELTA incremental desta amostra (ex: ~0.001m a 323Hz).
             // O PoseTracker acumula via update() (compose); set() SUBSTITUIRIA a
             // pose acumulada pelo delta isolado -> odom_tracker.pose() ~0 sempre
