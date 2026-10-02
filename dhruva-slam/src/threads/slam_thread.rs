@@ -453,8 +453,14 @@ impl SlamContext {
             // medido: odom_delta=(0,0,0) com o robo girando 100° em 10s.
             self.odom_tracker.update(&odom_pose);
 
-            // Odometry since the last odometry update (for interpolated pose).
-            let odom_delta = self.last_odom_pose.inverse().compose(&odom_pose);
+            // Interpolated pose: SLAM pose (do ultimo scan) + odometria acumulada
+            // desde esse scan. odom_pose aqui e o delta de UMA amostra (local);
+            // a referencia global do ultimo scan e last_odom_pose. Compose-los
+            // direto mistura local com global -> published_pose travava perto do
+            // scan e puxava a pose publicada pra tras (close_loop via -24° quando
+            // o scan matcher ja tinha -133°). Usar o tracker ACUMULADO desde o
+            // ultimo scan e' a interpolação correta.
+            let odom_delta = self.last_odom_pose.inverse().compose(&self.odom_tracker.pose());
             let published_pose = self.slam.current_pose().compose(&odom_delta);
 
             // Update distance traveled
