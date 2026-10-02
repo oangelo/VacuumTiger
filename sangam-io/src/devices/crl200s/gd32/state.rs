@@ -133,6 +133,26 @@ impl ComponentState {
             || self.wheel_motor_enabled.load(Ordering::Relaxed)
     }
 
+    /// True when a non-wheel actuator (lidar, brushes, vacuum, water pump) is
+    /// active.
+    ///
+    /// `wheel_motor_enabled` is deliberately excluded: it represents the drive
+    /// request itself, which the dead-man switch is stopping. The dead-man path
+    /// uses this to decide whether it may leave navigation mode (0x02):
+    ///
+    /// - any non-wheel actuator active -> keep mode 0x02 latched. Dropping it
+    ///   here would clear `motor_mode_set`, and the next heartbeat cycle would
+    ///   re-send `0x65 02`, producing the `0x02 -> 0x00 -> 0x02` flap that stops
+    ///   the spinning lidar motor (see `docs/lidar-delta2d.md`).
+    /// - nothing else active -> exit to 0x00 as before.
+    pub fn other_component_active(&self) -> bool {
+        self.vacuum.load(Ordering::Relaxed) > 0
+            || self.main_brush.load(Ordering::Relaxed) > 0
+            || self.side_brush.load(Ordering::Relaxed) > 0
+            || self.water_pump.load(Ordering::Relaxed) > 0
+            || self.lidar_enabled.load(Ordering::Relaxed)
+    }
+
     /// Get current velocity values (linear_mm_s, angular_mrad_s)
     pub fn get_velocities(&self) -> (i16, i16) {
         (

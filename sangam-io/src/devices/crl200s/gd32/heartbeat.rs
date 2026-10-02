@@ -41,7 +41,6 @@
 
 use super::packet::{TxPacket, heartbeat_packet, motor_mode_nav_packet, request_stm32_packet};
 use super::state::ComponentState;
-use serialport::SerialPort;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -94,8 +93,8 @@ const STM32_REQUEST_INTERVAL_MS: u64 = 1500;
 ///
 /// The blocking mutex acquisition is intentional: we prioritize heartbeat delivery
 /// over other operations to maintain safety guarantees.
-pub(super) fn heartbeat_loop(
-    port: Arc<Mutex<Box<dyn SerialPort>>>,
+pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
+    port: Arc<Mutex<W>>,
     shutdown: Arc<AtomicBool>,
     interval_ms: u64,
     component_state: Arc<ComponentState>,
@@ -159,7 +158,16 @@ pub(super) fn heartbeat_loop(
             // cair (cliente morto/rede) NAO `p por si so` - o daemon continua
             // reenviando a ultima velocidade. Aqui, se ha velocidade != 0 e
             // nenhum comando de drive chegou em `deadman_timeout_ms`, fazemos
-            // a parada explicita (0,0 + modo 0x00), como manda a seguranca.
+            // a parada explicita (0,0), como manda a seguranca.
+            //
+            // FIX (dead-man flap): sair para o modo 0x00 aqui e o que produzia
+            // o flap `0x02 -> 0x00 -> 0x02` com o LiDAR ligado. Ao soltar o modo
+            // navegacao limpavamos `motor_mode_set`; no ciclo seguinte
+            // `any_component_active` (o LiDAR) re-seta `0x65 02`. Reenviar
+            // `0x65 02` para o motor do LiDAR (item 1 de docs/lidar-delta2d.md).
+            // Agora, se algum componente que NAO e a roda ainda estiver ativo,
+            // MANTEMOS o modo navegacao e so zeramos a velocidade (rodas
+            // freadas). Se nada mais estiver ativo, caimos para 0x00 como antes.
             if component_state.deadman_expired() {
                 if !component_state.deadman_tripped.load(Ordering::Relaxed) {
                     log::warn!(
@@ -169,7 +177,8 @@ pub(super) fn heartbeat_loop(
                     );
                     component_state.deadman_tripped.store(true, Ordering::Relaxed);
                 }
-                // Sto explicita: zera estado -> envia 0,0 -> sai do modo 0x02.
+                // Parada explicita das rodas: zera o estado e envia 0,0. O
+                // pedido de tracao e descartado (nao ha mais cliente).
                 component_state.linear_velocity.store(0, Ordering::Relaxed);
                 component_state.angular_velocity.store(0, Ordering::Relaxed);
                 component_state.wheel_motor_enabled.store(false, Ordering::Relaxed);
@@ -177,17 +186,25 @@ pub(super) fn heartbeat_loop(
                 if let Err(e) = pkt.send_to(&mut *port) {
                     log::error!("Dead-man stop velocity send failed: {}", e);
                 }
-                pkt.set_motor_mode(0x00);
-                if let Err(e) = pkt.send_to(&mut *port) {
-                    log::error!("Dead-man stop mode send failed: {}", e);
+                if component_state.other_component_active() {
+                    // Mantem 0x65 02 (ja latcheado) -> rodas freadas, LiDAR
+                    // segue girando. NAO limpar `motor_mode_set`.
+                    log::warn!(
+                        "DEAD-MAN: componente ativo presente - modo navegacao MANTIDO, rodas paradas (0x66 0,0)"
+                    );
+                } else {
+                    // Nada mais ativo: pode sair do modo (roda livre), como antes.
+                    pkt.set_motor_mode(0x00);
+                    if let Err(e) = pkt.send_to(&mut *port) {
+                        log::error!("Dead-man stop mode send failed: {}", e);
+                    }
+                    component_state
+                        .motor_mode_set
+                        .store(false, Ordering::Relaxed);
                 }
-                component_state
-                    .motor_mode_set
-                    .store(false, Ordering::Relaxed);
                 // Dorme e volta ao topo. O proximo comando de drive de um
-                // cliente novo rearma (`note_drive_command`); se o lidar estiver
-                // ligado, `any_component_active` re-seta o modo 0x02 no ciclo
-                // seguinte, mas com velocidade 0 o robo permanece parado.
+                // cliente novo rearma (`note_drive_command`); com um componente
+                // ativo o modo 0x02 permanece latcheado sem flap.
                 drop(port);
                 thread::sleep(Duration::from_millis(interval_ms));
                 continue;
@@ -261,4 +278,141 @@ pub(super) fn heartbeat_loop(
     }
 
     log::info!("Heartbeat thread exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write sink that records every byte the heartbeat loop emits, so a test
+    /// can parse the exact frame stream that would go to `/dev/ttyS3`. Stands in
+    /// for the serial port: the heartbeat thread only ever *writes*, so a full
+    /// `SerialPort` mock would add nothing.
+    #[derive(Clone, Default)]
+    struct RecordingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Parse a raw GD32 frame stream (`FA FB | LEN | CMD PAYLOAD CRC`) into
+    /// `(CMD, PAYLOAD)` pairs, resyncing on junk.
+    fn parse_frames(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 3 < bytes.len() {
+            if bytes[i] == 0xFA && bytes[i + 1] == 0xFB {
+                let len = bytes[i + 2] as usize;
+                let total = len + 3;
+                if i + total <= bytes.len() {
+                    out.push((bytes[i + 3], bytes[i + 4..i + total - 2].to_vec()));
+                    i += total;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Ordered sequence of motor-mode values (CMD 0x65) seen in the stream.
+    fn mode_sequence(frames: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        frames
+            .iter()
+            .filter(|(cmd, _)| *cmd == 0x65)
+            .map(|(_, p)| p[0])
+            .collect()
+    }
+
+    /// Run the real heartbeat loop against a recording sink for `ms`, then stop
+    /// and return the parsed frame stream.
+    fn run_heartbeat(state: Arc<ComponentState>, ms: u64) -> Vec<(u8, Vec<u8>)> {
+        let rec = RecordingWriter::default();
+        let bytes = Arc::clone(&rec.bytes);
+        let port = Arc::new(Mutex::new(rec));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let port = Arc::clone(&port);
+            let shutdown = Arc::clone(&shutdown);
+            thread::spawn(move || heartbeat_loop(port, shutdown, 20, state))
+        };
+        thread::sleep(Duration::from_millis(ms));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        let out = bytes.lock().unwrap().clone();
+        parse_frames(&out)
+    }
+
+    /// REPRODUCER determinístico do flap de modo no dead-man.
+    ///
+    /// Caminho real do heartbeat, LiDAR ligado, velocidade != 0 e dead-man
+    /// vencido (sem `note_drive_command`). Codifica o comportamento SEGURO: as
+    /// rodas param com `0x66 0,0`, mas o modo navegação NÃO é solto — logo não
+    /// há `0x00` nem reenvio de `0x65 02`.
+    ///
+    /// No código ANTES do fix este teste FALHA com `modes == [0x02, 0x00, 0x02]`
+    /// (o flap); depois do fix passa com `modes == [0x02]`.
+    #[test]
+    fn deadman_with_lidar_keeps_nav_mode_no_flap() {
+        let state = Arc::new(ComponentState::new(73, 100));
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.linear_velocity.store(4483, Ordering::Relaxed); // ~1 m/s
+
+        let frames = run_heartbeat(state, 500);
+        let modes = mode_sequence(&frames);
+
+        let stopped = frames.iter().any(|(cmd, p)| {
+            *cmd == 0x66
+                && p.len() == 8
+                && i32::from_le_bytes([p[0], p[1], p[2], p[3]]) == 0
+                && i32::from_le_bytes([p[4], p[5], p[6], p[7]]) == 0
+        });
+        assert!(
+            stopped,
+            "dead-man deve enviar 0x66 0,0 (rodas paradas). modos={:?}",
+            modes
+        );
+        assert_eq!(
+            modes,
+            vec![0x02],
+            "com LiDAR ativo o modo navegação deve permanecer latcheado \
+             (0x65 02 enviado uma única vez, LiDAR segue girando). \
+             Modos observados = {:?}; um 0x00 intermediário é o FLAP 0x02 -> 0x00 -> 0x02.",
+            modes
+        );
+    }
+
+    /// Guarda de regressão: sem nenhum outro componente ativo, o dead-man
+    /// continua saindo para 0x00 (roda livre) como antes — o fix não pode
+    /// engolir esse caminho.
+    #[test]
+    fn deadman_without_other_components_still_exits_nav_mode() {
+        let state = Arc::new(ComponentState::new(73, 100));
+        state.linear_velocity.store(4483, Ordering::Relaxed);
+        state.wheel_motor_enabled.store(true, Ordering::Relaxed);
+
+        let frames = run_heartbeat(state, 500);
+        let modes = mode_sequence(&frames);
+
+        assert!(
+            modes.iter().filter(|m| **m == 0x00).count() == 1,
+            "sem outro componente ativo o dead-man deve sair para 0x00 uma vez. modos={:?}",
+            modes
+        );
+        assert_ne!(
+            modes.last(),
+            Some(&0x02),
+            "após sair para 0x00 não pode voltar para 0x02. modos={:?}",
+            modes
+        );
+    }
 }
