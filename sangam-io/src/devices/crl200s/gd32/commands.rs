@@ -530,11 +530,15 @@ fn handle_lidar(
             //   -> regime mantido pelo thread de heartbeat (71 <pwm> a 20 ms)
             //
             // O `0x97 00` NAO se manda: o ciclo do trilho (GPIO 233) e o GD32 quem faz.
-            log::info!(
-                "Lidar enable: sequencia de bancada (A2 antes do power, 20 ms entre frames, \
-                 spin-up 100% por ~1,2 s), PWM de regime {}%",
-                pwm
-            );
+            // *** CORRIGIDO 02/10: o `0x97 01` SOZINHO NAO PROVA POWER. Medido na bancada:
+            // o Delta-2D so (re)comeca a transmitir (ttyS1 ~7,8 KB/s) depois de um ciclo
+            // REAL no trilho (off -> ~2 s -> on). O instrumento cru (`lidar_init_test`)
+            // entrega 7,8 KB/s sustentados quando chaveia o trilho; o enable sem o OFF
+            // anterior deixa o ttyS1 em 0 byte (o motor assinala spin-up mas o sensor
+            // nao manda dados). Aqui fazemos o ciclo EXPLICITO: 0x97 00 -> wait -> 0x97 01.
+            pkt.set_lidar_power(false);
+            send_packet(port, pkt)?;
+            thread::sleep(Duration::from_millis(2000));
 
             pkt.set_motor_mode(0x02);
             send_packet(port, pkt)?;
