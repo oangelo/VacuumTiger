@@ -8,8 +8,12 @@
 //! Dois modos:
 //!   --spin THETA_ALVO   gira ate a pose do SLAM atingir o alvo (+- tol), usando a
 //!                       pose, nao relogio cego.
-//!   --straight METROS   anda reto pela odometria bruta (raw_odometry), parando antes
-//!                       se o LidarScan frontal detectar obstaculo < threshold.
+//!   --straight METROS   anda reto e mede a DISTANCIA pela ODOMETRIA DE RODA
+//!                       (contadores do sangam-io, `--straight-source odom`, padrao),
+//!                       SEM depender do dhruva nem da pose do SLAM. Com
+//!                       `--straight-source slam` usa a pose do SLAM (comportamento
+//!                       antigo, mantido para comparacao em bancada) e para por
+//!                       obstaculo frontal pelo LidarScan.
 //!
 //! Seguranca:
 //!   - O dead-man do sangam-io (default 3000ms) e a rede: se este processo morrer ou
@@ -372,6 +376,61 @@ const WHEEL_TICKS_PER_METER: f32 = 4516.7;
 const WHEEL_BASE_M: f32 = 0.209;
 const WHEEL_DIFF_TO_RAD: f32 = WHEEL_TICKS_PER_METER * WHEEL_BASE_M; // 944.0
 
+/// Escala LINEAR calibrada (trena 30/09 + ICP 01/10, `docs/calibracao.md` do repo
+/// de pesquisa): `TICKS_M = 4516,7` tick/m  =>  1 tick = 0,2214 mm. E' a MESMA
+/// escala usada no giro (`WHEEL_TICKS_PER_METER`). NOTA (issue #2): a escala pode
+/// estar ~4-10% otimista — NAO recalibrar aqui, usar exatamente este valor.
+const TICKS_M: f32 = WHEEL_TICKS_PER_METER;
+
+/// Integrador de distância por ODOMETRIA DE RODA PURA (sem dhruva, sem SLAM).
+///
+/// Acumula o deslocamento linear a partir dos contadores crus de roda publicados
+/// pelo sangam-io (`wheel_left`/`wheel_right`, u16 com wrap de registrador).
+/// Num robô diferencial andando reto as duas rodas giram quase igual: a distância
+/// é a MÉDIA dos dois deltas. É puro/offline (nenhuma I/O) para poder ser testado
+/// em unidade sem rede nem robô.
+#[derive(Default)]
+struct OdomStraight {
+    last: Option<(u16, u16)>,
+    travelled: f32, // metros
+}
+
+impl OdomStraight {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Distância acumulada (m).
+    fn travelled(&self) -> f32 {
+        self.travelled
+    }
+
+    /// Atualiza com os contadores mais recentes e devolve a distância acumulada.
+    /// O primeiro par só fixa a referência (delta = 0).
+    fn update(&mut self, cur: (u16, u16)) -> f32 {
+        if let Some(prev) = self.last {
+            self.travelled += wheel_delta_m(prev, cur);
+        }
+        self.last = Some(cur);
+        self.travelled
+    }
+
+    /// Critério de parada: para ao ATINGIR ou PASSAR o alvo (nunca antes).
+    fn reached(&self, target_m: f32) -> bool {
+        self.travelled >= target_m
+    }
+}
+
+/// Delta de distância (m) entre dois pares de contadores de roda. O wrap de u16
+/// tem de virar delta COM SINAL via `wrapping_sub` lido como i16 (mesma armadilha
+/// da Fase 0 e do `spin_odom`: 65535 -> 1 = +2 ticks, nao -65534). Frente: as duas
+/// rodas contam para cima (+); ré: para baixo (−), logo o deslocamento é negativo.
+fn wheel_delta_m(prev: (u16, u16), cur: (u16, u16)) -> f32 {
+    let dl = cur.0.wrapping_sub(prev.0) as i16 as f32;
+    let dr = cur.1.wrapping_sub(prev.1) as i16 as f32;
+    (dl + dr) * 0.5 / TICKS_M
+}
+
 /// (rmin_m, ang_rad) no setor frontal (+-fov_rad) ou None se vazio.
 fn min_frontal_range(scan: &dhruva::LidarScan, fov_rad: f32) -> Option<(f32, f32)> {
     if scan.ranges.is_empty() || scan.angle_increment <= 0.0 {
@@ -460,6 +519,11 @@ struct Args {
     /// Modo reto: metros a andar
     #[arg(long)]
     straight: Option<f32>,
+    /// Fonte de distância no reto: "odom" (odometria de roda pura via ticks do
+    /// sangam-io — padrao, NAO exige o dhruva) ou "slam" (a pose do SLAM, o modo
+    /// antigo, que tambem para por obstaculo frontal pelo LidarScan).
+    #[arg(long, default_value = "odom")]
+    straight_source: String,
 }
 
 struct Controller {
@@ -504,14 +568,28 @@ impl Controller {
 
         // Agora o dhruva. Como a ordem e "drive 1o, dhruva 2o", ele pode nao estar de
         // pe ainda (sobe depois) - tenta por ate 20s.
-        // O dhruva so e' obrigatorio nas fases que usam a pose SLAM (straight e
-        // spin-slam). No modo giro-odom e' OPCIONAL: o incontrole vira autonomo
-        // (drive via sangam + ticks via sangam_raw), entao nao travamos por ele.
+        // O dhruva so e' obrigatorio nas fases que usam a pose SLAM (straight-slam
+        // e spin-slam). Nos modos de odometria pura (spin-odom e straight-odom) e'
+        // OPCIONAL: o controlador vira autonomo (drive via sangam + ticks via
+        // sangam_raw), entao nao travamos por ele.
         let odom_spin = args.spin.is_some() && args.spin_source != "slam";
-        let need_dhruva = args.straight.is_some() || args.spin_source == "slam" || args.dry_run;
+        let odom_straight = args.straight.is_some() && args.straight_source != "slam";
+        let need_dhruva = (args.spin.is_some() && args.spin_source == "slam")
+            || (args.straight.is_some() && args.straight_source == "slam")
+            || args.dry_run;
+        // No straight-odom nem TENTAMOS conectar o dhruva: o straight roda sozinho
+        // lendo os ticks direto do sangam. Conectar o dhruva abriria um 2o socket na
+        // porta 5555 (o receiver UDP dele) disputando o unicast com o SangamDirectReader
+        // — os dois roubam bytes um do outro e a odometria congela. Sem dhruva o
+        // straight-odom tambem comeca na hora (sem os 20s de espera).
+        let try_dhruva = !odom_straight;
 
         let mut slam: Option<Conn> = None;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = if try_dhruva {
+            Instant::now() + Duration::from_secs(20)
+        } else {
+            Instant::now() // sem dhruva: nao espera (straight roda 100% por odometria)
+        };
         while Instant::now() < deadline {
             if let Ok(c) = Conn::connect(&args.host_slam, args.port_slam) {
                 slam = Some(c);
@@ -540,22 +618,25 @@ impl Controller {
         } else if need_dhruva {
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "dhruva nao subiu em 20s"));
         } else {
-            eprintln!("-> dhruva ausente (OK: modo giro-odom autonomo, lendo direto do sangam)");
+            eprintln!("-> dhruva ausente (OK: modo odometria autonoma, lendo direto do sangam)");
         }
 
-        // Leitor direto do sangam (porta 5555): SO abrimos no modo giro-odom, que e'
-        // onde ele e' usado (e onde o dhruva esta derrubado, sem 2 sockets na 5555).
-        // Nas outras fases (straight/slam-spin) NAO abrimos p/ nao roubar bytes do
-        // dhruva (o receiver dele cai de 251 pkt/5s para ~30 e a pose congela).
-        let sangam_raw = if odom_spin {
+        // Leitor direto do sangam (porta 5555): abrimos em QUALQUER modo de odometria
+        // pura (spin-odom OU straight-odom), que e' onde ele e' usado — e onde o dhruva
+        // esta' derrubado, sem 2 sockets na 5555. Nas fases que usam a pose SLAM
+        // (straight-slam/slam-spin) NAO abrimos p/ nao roubar bytes do dhruva (o
+        // receiver dele cai de 251 pkt/5s para ~30 e a pose congela).
+        let odom_mode = odom_spin || odom_straight;
+        let sangam_raw = if odom_mode {
             SangamDirectReader::bind(args.port_drive).ok()
         } else {
             None
         };
         if sangam_raw.is_some() {
             eprintln!("-> sangam direct reader na 0.0.0.0:{} (odometria pura)", args.port_drive);
-        } else if odom_spin {
-            eprintln!("-> AVISO: sangam direct reader nao abriu (porta {})", args.port_drive);
+        } else if odom_mode {
+            eprintln!("-> AVISO: sangam direct reader nao abriu (porta {}); odometria ficara' zerada",
+                      args.port_drive);
         }
 
         Ok(Self {
@@ -768,7 +849,73 @@ impl Controller {
         false
     }
 
+    /// Despacha o `--straight` para a fonte pedida em `--straight-source`:
+    /// "odom" (padrao, odometria de roda pura, sem dhruva) ou "slam" (a pose do SLAM,
+    /// comportamento antigo). Ver `straight_odom` / `straight_slam`.
     fn straight(&mut self, meters: f32) -> bool {
+        if self.args.straight_source == "slam" {
+            self.straight_slam(meters)
+        } else {
+            self.straight_odom(meters)
+        }
+    }
+
+    /// Anda reto medindo a distância por ODOMETRIA DE RODA PURA (ticks do sangam-io,
+    /// porta 5555), SEM o dhruva e SEM a pose do SLAM. Mesma integração do
+    /// `spin_odom` (wrap de u16 -> i16), só que na MÉDIA das duas rodas (deslocamento
+    /// linear, `OdomStraight`). Mesma desaceleração final do modo SLAM (`remaining <
+    /// 0.3` -> velocidade reduzida) e parada explícita ao atingir o alvo.
+    ///
+    /// ATENÇÃO: no modo odom NÃO há checagem de obstáculo — ela depende do LidarScan,
+    /// que só chega pelo dhruva (fica para a issue #4). Sem dhruva, a rede de
+    /// segurança é o dead-man do sangam-io (~3 s) + o `--timeout` deste binário.
+    fn straight_odom(&mut self, meters: f32) -> bool {
+        if self.sangam_raw.is_none() {
+            eprintln!("!! straight-odom exige o sangam direct reader (porta {}); abortando",
+                      self.args.port_drive);
+            return false;
+        }
+        let t0 = Instant::now();
+        let mut odom = OdomStraight::new();
+        eprintln!("andando {meters:.2} m reto por ODOMETRIA DE RODA (sem dhruva/SLAM)");
+        eprintln!("   SEM checagem de obstaculo neste modo (issue #4) — dead-man do sangam e' a rede");
+        while t0.elapsed() < self.timeout {
+            // Janela de ~400 ms: pega o par de contadores mais recente do sangam.
+            let mut newest: Option<(u16, u16)> = None;
+            let w0 = Instant::now();
+            while w0.elapsed().as_millis() < 400 {
+                if let Some(rd) = &mut self.sangam_raw {
+                    if let Some((l, r)) = rd.read_ticks() {
+                        newest = Some((l, r));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if let Some(cur) = newest {
+                odom.update(cur);
+            }
+            let dist = odom.travelled();
+            if odom.reached(meters) {
+                let _ = self.cmd_drive(0.0, 0.0);
+                eprintln!("\nstop: percorreu {dist:.2} m (alvo {meters:.2}) [odometria de roda]");
+                return true;
+            }
+            let remaining = (meters - dist).max(0.0);
+            let speed = if remaining < 0.3 { self.args.linear * 0.35 } else { self.args.linear };
+            let _ = self.cmd_drive(speed, 0.0);
+            eprintln!("  t={:5.1}s dist={dist:.2}/{meters:.2}m (odo) speed={speed:+.3}",
+                      t0.elapsed().as_secs_f32());
+        }
+        let _ = self.cmd_drive(0.0, 0.0);
+        eprintln!("!! timeout — percorreu {:.2} m de {meters:.2} m (odometria de roda)",
+                  odom.travelled());
+        false
+    }
+
+    /// Modo antigo: anda reto medindo a distância pela POSE DO SLAM (`robot_status.pose`
+    /// do dhruva, TCP 5557/UDP) e para por obstáculo frontal < `obst_threshold` pelo
+    /// LidarScan. Mantido para comparação em bancada (`--straight-source slam`).
+    fn straight_slam(&mut self, meters: f32) -> bool {
         let (start, _) = self.latest(2000);
         let Some((sx, sy, _)) = start else {
             eprintln!("!! sem pose inicial — abortando");
@@ -817,6 +964,10 @@ fn main() -> std::io::Result<()> {
         eprintln!("escolha exatamente um: --spin THETA ou --straight METROS");
         std::process::exit(2);
     }
+    if args.straight.is_some() && args.straight_source != "odom" && args.straight_source != "slam" {
+        eprintln!("--straight-source deve ser \"odom\" (padrao) ou \"slam\"");
+        std::process::exit(2);
+    }
 
     let mut ctrl = Controller::new(args.clone())?;
     let ok = if let Some(t) = args.spin {
@@ -827,4 +978,114 @@ fn main() -> std::io::Result<()> {
     // stop sempre (igual finally do python) - vale inclusive no Ctrl-C (SIGINT do terminal)
     ctrl.stop_drive();
     std::process::exit(if ok { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 1 tick = 1/TICKS_M m = 0,2214 mm. Folga generosa para f32.
+    const EPS: f32 = 1e-5;
+
+    /// Wrap de u16: 65535 -> 1 é +2 ticks (nao -65534).
+    #[test]
+    fn wrap_u16_e_delta_positivo_de_2_ticks() {
+        let d = wheel_delta_m((65535, 65535), (1, 1));
+        assert!(d > 0.0, "delta deveria ser positivo, veio {d}");
+        assert!((d - 2.0 / TICKS_M).abs() < EPS, "esperado 2 ticks, veio {d}");
+    }
+
+    /// Só a roda esquerda cruza o wrap: média dos deltas (+2 e 0) = +1 tick.
+    #[test]
+    fn wrap_u16_em_uma_roda_apenas() {
+        let d = wheel_delta_m((65535, 100), (1, 100));
+        assert!((d - 1.0 / TICKS_M).abs() < EPS, "média de +2 e 0 = +1 tick, veio {d}");
+    }
+
+    /// Ré: contadores andam para baixo -> deslocamento NEGATIVO.
+    #[test]
+    fn re_tem_delta_negativo() {
+        let d = wheel_delta_m((100, 100), (90, 90));
+        assert!(d < 0.0, "ré deveria dar delta negativo, veio {d}");
+        assert!((d - (-10.0 / TICKS_M)).abs() < EPS, "esperado -10 ticks, veio {d}");
+    }
+
+    /// Conversão ticks -> metros: ~4516,7 ticks na média das rodas = ~1,0 m.
+    #[test]
+    fn conversao_ticks_para_metros() {
+        let d = wheel_delta_m((0, 0), (4517, 4517));
+        assert!((d - 1.0).abs() < 0.001, "4517 ticks deveriam ser ~1,0 m, veio {d}");
+    }
+
+    /// Rodas com contagens diferentes: usa a MÉDIA (modelo diferencial).
+    #[test]
+    fn usa_media_das_duas_rodas() {
+        let d = wheel_delta_m((0, 0), (1000, 1200));
+        assert!((d - 1100.0 / TICKS_M).abs() < EPS, "média 1100 ticks, veio {d}");
+    }
+
+    /// O primeiro update só fixa a referência (delta = 0), sem salto.
+    #[test]
+    fn primeiro_update_nao_acumula() {
+        let mut o = OdomStraight::new();
+        assert_eq!(o.travelled(), 0.0);
+        let t = o.update((5000, 5000));
+        assert_eq!(t, 0.0, "primeiro par nao deve gerar deslocamento");
+    }
+
+    /// Acumula entre updates sucessivos.
+    #[test]
+    fn acumula_entre_updates() {
+        let mut o = OdomStraight::new();
+        o.update((0, 0));
+        o.update((1000, 1000));
+        let t = o.update((2000, 2000));
+        assert!((t - 2000.0 / TICKS_M).abs() < EPS, "esperado 2000 ticks acumulados, veio {t}");
+    }
+
+    /// Critério de parada: NÃO para antes do alvo.
+    #[test]
+    fn nao_para_antes_do_alvo() {
+        let mut o = OdomStraight::new();
+        o.update((0, 0));
+        o.update((2200, 2200)); // 0,487 m
+        assert!(!o.reached(0.5), "nao deveria parar em {:.3} m com alvo 0.5", o.travelled());
+        assert!((o.travelled() - 2200.0 / TICKS_M).abs() < EPS);
+    }
+
+    /// Critério de parada: para ao ATINGIR o alvo.
+    #[test]
+    fn para_ao_atingir_o_alvo() {
+        let mut o = OdomStraight::new();
+        o.update((0, 0));
+        o.update((2200, 2200)); // 0,487 m
+        o.update((2300, 2300)); // +0,022 -> 0,509 m
+        assert!(o.reached(0.5), "deveria parar em {:.3} m com alvo 0.5", o.travelled());
+    }
+
+    /// Critério de parada: para ao PASSAR o alvo (overshoot).
+    #[test]
+    fn para_ao_passar_o_alvo() {
+        let mut o = OdomStraight::new();
+        o.update((0, 0));
+        o.update((10000, 10000)); // 2,2 m >> 0.5
+        assert!(o.reached(0.5));
+    }
+
+    /// Alvo 0 => parada imediata (nada a andar).
+    #[test]
+    fn alvo_zero_para_de_imediato() {
+        let o = OdomStraight::new();
+        assert!(o.reached(0.0));
+    }
+
+    /// Ré acumulada: mesmo em módulo grande, não "fecha" um alvo positivo.
+    #[test]
+    fn re_nao_fecha_alvo_positivo() {
+        let mut o = OdomStraight::new();
+        o.update((10000, 10000));
+        o.update((5000, 5000)); // -5000 ticks = -1,1 m
+        assert!(o.travelled() < 0.0);
+        assert!(!o.reached(0.5));
+    }
 }
