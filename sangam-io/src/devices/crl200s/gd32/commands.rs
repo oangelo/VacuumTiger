@@ -97,6 +97,23 @@ const LIDAR_START_ATTEMPTS: u32 = 3;
 const LIDAR_VERIFY_TIMEOUT_MS: u64 = 8000;
 /// Poll interval while waiting for the scan counter to advance (ms).
 const LIDAR_VERIFY_POLL_MS: u64 = 100;
+/// How long the rail stays OFF between `0x97 00` and `0x97 01` (ms).
+///
+/// Issue #17 (03/10/2026): a fix de hoje de manha removeu o `0x97 00` do start, o que
+/// fez o trilho nunca mais ser ciclado -> sensor bom parte (8/8, 6/6) mas sensor
+/// TRAVADO nao recupera (0/6). O ciclo REAL do trilho e o que desbloqueia. 2 s e o
+/// minimo; a recuperacao medida no metal usou ~10 s, mas 2 s ja e um ciclo efetivo
+/// no protocolo (o OFF e engolido pela fabrica no boot so se vier ANTES do modo nav,
+/// e aqui vem depois).
+const LIDAR_RAIL_OFF_SETTLE_MS: u64 = 2000;
+/// Espera de BOOT depois do `0x97 01` (power ON), antes da rajada (ms).
+///
+/// Bancada (medida 01/10): ciclo do trilho + rajada imediata (<1 s) = 0 byte por 20 s;
+/// ciclo + ~10 s + a MESMA rajada = 7,8 KB/s. O OFF estava no plano ate de manha mas a
+/// rajada ia cedo demais -> mudo (4/4). As DUAS metades sao necessarias: ciclo real E
+/// espera de boot. A fabrica liga de imediato porque faz o ciclo no boot (horas antes);
+/// num start a frio com ciclo agora, o sensor precisa desse tempo para sair do reset.
+const LIDAR_BOOT_MS: u64 = 12000;
 
 // ============================================================================
 // Component IDs
@@ -516,24 +533,37 @@ fn handle_led(
 pub(crate) enum LidarStartStep {
     /// `0x65 02` — must come first, otherwise the GD32 ignores the lidar frames.
     ModeNav,
-    /// `0xA2` prep payload.
-    Prep,
-    /// `0x97 01` — rail ON.
+    /// `0x97 00` — rail OFF. First half of the real power cycle that un-sticks a sensor.
+    RailOff,
+    /// `0x97 01` — rail ON. Second half of the power cycle.
     RailOn,
+    /// Blocking wait `LIDAR_BOOT_MS` after power-on, before the burst (issue #17:
+    /// cycle + burst-immediate is mute, cycle + ~10 s works).
+    BootWait,
     /// `0x9D 01` — start.
     Start,
+    /// `0xA2` prep payload.
+    Prep,
     /// Spin-up at 100% (the motor does not leave standstill below that).
     SpinUp,
     /// Settle at the configured PWM; the heartbeat keeps refreshing it.
     Regime,
 }
 
-/// O `lidar enable` — ordem igual a da FABRICA (MITM 01/10/2026, base->limpando):
-/// `0x65 02 -> 0x97 01 -> 0x9D 01 -> 0xA2`, colados, depois PWM 100% (spin-up) e regime.
-/// A fabrica NAO faz `0x97 00` nem espera de boot no start (o OFF so aparece no boot).
+/// O `lidar enable` robusto (issue #17, 03/10/2026) — a fábrica + as DUAS metades:
+///
+/// A fábrica (MITM 01/10) faz `0x65 02 -> 0x97 01 -> 0x9D 01 -> 0xA2` colados, sem
+/// OFF e sem espera — mas só porque faz o ciclo do trilho (`0x97 00`) já no BOOT,
+/// horas antes. Num start a frio com ciclo agora, faltam as duas metades medidas:
+/// (1) o ciclo real `0x97 00 -> 0x97 01` (desbloqueia sensor travado — sem ele, 0/6)
+/// e (2) a espera de boot depois do power-on (sem ela, burst cedo demais -> 4/4 mudo).
+///
+/// Ordem: `ModeNav -> RailOff -> RailOn -> BootWait -> Start -> Prep -> SpinUp -> Regime`.
 pub(crate) const LIDAR_START_PLAN: &[LidarStartStep] = &[
     LidarStartStep::ModeNav,
+    LidarStartStep::RailOff,
     LidarStartStep::RailOn,
+    LidarStartStep::BootWait,
     LidarStartStep::Start,
     LidarStartStep::Prep,
     LidarStartStep::SpinUp,
@@ -609,13 +639,27 @@ fn handle_lidar(
                             send_packet(port, pkt)?;
                             thread::sleep(Duration::from_millis(MODE_SWITCH_PAUSE_MS));
                         }
-                        LidarStartStep::Prep => {
-                            pkt.set_imu_calibrate_state(&IMU_DEFAULT_PAYLOAD);
+                        LidarStartStep::RailOff => {
+                            // First half of the real power cycle — un-sticks a stuck sensor.
+                            pkt.set_lidar_power(false);
                             send_packet(port, pkt)?;
-                            thread::sleep(Duration::from_millis(LIDAR_BURST_GAP_MS));
+                            thread::sleep(Duration::from_millis(LIDAR_RAIL_OFF_SETTLE_MS));
                         }
                         LidarStartStep::RailOn => {
                             pkt.set_lidar_power(true);
+                            send_packet(port, pkt)?;
+                        }
+                        LidarStartStep::BootWait => {
+                            // The Delta-2D needs boot time after power-on before the burst
+                            // (cycle + burst-immediate is mute; cycle + ~10 s works, issue #17).
+                            log::info!(
+                                "Lidar: aguardando boot de {} ms apos power-on",
+                                LIDAR_BOOT_MS
+                            );
+                            thread::sleep(Duration::from_millis(LIDAR_BOOT_MS));
+                        }
+                        LidarStartStep::Prep => {
+                            pkt.set_imu_calibrate_state(&IMU_DEFAULT_PAYLOAD);
                             send_packet(port, pkt)?;
                             thread::sleep(Duration::from_millis(LIDAR_BURST_GAP_MS));
                         }
@@ -896,24 +940,26 @@ fn handle_mcu(
 mod tests {
     use super::*;
 
-    /// O `lidar enable` deve seguir a ORDEM da fabrica (MITM 01/10/2026, base->limpando):
-        /// `0x65 02` (nav) -> `0x97 01` (power) -> `0x9D 01` (start) -> `0xA2` (prep) -> spin-up -> regime.
-        /// Sem `0x97 00` e sem espera de boot no start — a fabrica NAO faz nenhum dos dois.
-        #[test]
-        fn lidar_start_plan_matches_factory_order() {
-            let plan = LIDAR_START_PLAN;
-            let pos = |s: LidarStartStep| {
-                plan.iter()
-                    .position(|x| *x == s)
-                    .unwrap_or_else(|| panic!("passo {:?} ausente no plano", s))
-            };
-            assert_eq!(plan[0], LidarStartStep::ModeNav, "0x65 02 primeiro (modo nav)");
-            assert!(pos(LidarStartStep::ModeNav) < pos(LidarStartStep::RailOn));
-            assert!(pos(LidarStartStep::RailOn) < pos(LidarStartStep::Start));
-            assert!(pos(LidarStartStep::Start) < pos(LidarStartStep::Prep));
-            assert!(pos(LidarStartStep::Prep) < pos(LidarStartStep::SpinUp));
-            assert!(pos(LidarStartStep::SpinUp) < pos(LidarStartStep::Regime));
-            assert_eq!(plan.len(), 6, "plano completo: sem passo extra/perdido");
+    /// O `lidar enable` robusto (issue #17, 03/10/2026) deve ciclar o trilho E esperar o boot:
+    /// `0x65 02` (nav) -> `0x97 00` (OFF) -> `0x97 01` (ON) -> BootWait -> `0x9D 01` (start)
+    /// -> `0xA2` (prep) -> spin-up -> regime. O OFF vem DEPOIS do modo nav (senão é engolido).
+    #[test]
+    fn lidar_start_plan_is_the_robust_sequence() {
+        let plan = LIDAR_START_PLAN;
+        let pos = |s: LidarStartStep| {
+            plan.iter()
+                .position(|x| *x == s)
+                .unwrap_or_else(|| panic!("passo {:?} ausente no plano", s))
+        };
+        assert_eq!(plan[0], LidarStartStep::ModeNav, "0x65 02 primeiro (modo nav)");
+        assert!(pos(LidarStartStep::ModeNav) < pos(LidarStartStep::RailOff));
+        assert!(pos(LidarStartStep::RailOff) < pos(LidarStartStep::RailOn));
+        assert!(pos(LidarStartStep::RailOn) < pos(LidarStartStep::BootWait));
+        assert!(pos(LidarStartStep::BootWait) < pos(LidarStartStep::Start));
+        assert!(pos(LidarStartStep::Start) < pos(LidarStartStep::Prep));
+        assert!(pos(LidarStartStep::Prep) < pos(LidarStartStep::SpinUp));
+        assert!(pos(LidarStartStep::SpinUp) < pos(LidarStartStep::Regime));
+        assert_eq!(plan.len(), 8, "plano completo: ciclo de trilho + boot + rajada + regime");
                 }
 
     /// A verificação é o que mata a falha silenciosa: sem scan, o enable tem que falhar.
