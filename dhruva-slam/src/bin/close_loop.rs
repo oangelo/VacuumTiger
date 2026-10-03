@@ -184,6 +184,12 @@ impl UdpReader {
 struct SangamDirectReader {
     sock: std::net::UdpSocket,
     buf: Vec<u8>,
+    /// Quantos datagramas do grupo `lidar` (com a chave `scan`) ja' vimos nesta
+    /// conexao. O MESMO socket UDP 5555 recebe os dois grupos (sensor_status e
+    /// lidar); este contador serve para confirmar que o LiDAR entrou em STREAMING
+    /// antes de comandar as rodas (o GD32 so' sustenta as rodas com um componente
+    /// ativo — ver SKILL do dead-man).
+    scans_seen: u64,
 }
 
 impl SangamDirectReader {
@@ -197,30 +203,63 @@ impl SangamDirectReader {
         s2.bind(&addr.into())?;
         let sock: std::net::UdpSocket = s2.into();
         sock.set_read_timeout(Some(Duration::from_millis(100)))?;
-        Ok(Self { sock, buf: Vec::new() })
+        Ok(Self { sock, buf: Vec::new(), scans_seen: 0 })
     }
 
-    /// (wheel_left, wheel_right) mais recentes do sensor_status, ou None.
-    fn read_ticks(&mut self) -> Option<(u16, u16)> {
+    /// Le UM datagrama, decodifica o SensorGroup e ATUALIZA o contador de scans
+    /// quando o grupo for `lidar` com a chave `scan`. Devolve o grupo (para o
+    /// chamador extrair os ticks, se for `sensor_status`). Nao bloqueia: o socket
+    /// tem read_timeout de 100ms, entao WouldBlock/TimedOut -> None.
+    fn read_group(&mut self) -> Option<sangamio::SensorGroup> {
         self.buf.resize(65536, 0);
         let (n, _) = match self.sock.recv_from(&mut self.buf) {
             Ok(v) => v,
             Err(_) => return None, // WouldBlock/TimedOut -> ok
         };
-        let bytes = &self.buf[..n];
-        if bytes.len() < 4 {
-            return None;
-        }
-        let msg_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        if 4 + msg_len > bytes.len() {
-            return None;
-        }
-        let payload = &bytes[4..4 + msg_len];
-        let msg = <sangamio::Message as prost::Message>::decode(payload).ok()?;
-        let sg = match msg.payload {
-            Some(sangamio::message::Payload::SensorGroup(sg)) => sg,
-            _ => return None,
+        // Decodifica dentro de um escopo para soltar o emprestimo de `self.buf`
+        // antes de mexer no contador `self.scans_seen`.
+        let sg = {
+            let bytes = &self.buf[..n];
+            if bytes.len() < 4 {
+                return None;
+            }
+            let msg_len =
+                u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            if 4 + msg_len > bytes.len() {
+                return None;
+            }
+            let payload = &bytes[4..4 + msg_len];
+            let msg = <sangamio::Message as prost::Message>::decode(payload).ok()?;
+            match msg.payload {
+                Some(sangamio::message::Payload::SensorGroup(sg)) => sg,
+                _ => return None,
+            }
         };
+        // O grupo `lidar` carrega o ponto de nuvem na chave `scan`. So' contamos
+        // quando a chave existe, ou seja quando ha' SCAN de verdade (nao um
+        // keep-alive vazio do grupo).
+        if sg.group_id == "lidar" && sg.values.contains_key("scan") {
+            self.scans_seen += 1;
+        }
+        Some(sg)
+    }
+
+    /// Le um datagrama so' para fazer avancar o contador de scans. Devolve `true`
+    /// se ESTE datagrama trouxe um scan do LiDAR.
+    fn poll_scan(&mut self) -> bool {
+        let before = self.scans_seen;
+        let _ = self.read_group();
+        self.scans_seen > before
+    }
+
+    /// Total de scans do LiDAR vistos ate agora (para log/telemetria).
+    fn scans_seen(&self) -> u64 {
+        self.scans_seen
+    }
+
+    /// (wheel_left, wheel_right) mais recentes do sensor_status, ou None.
+    fn read_ticks(&mut self) -> Option<(u16, u16)> {
+        let sg = self.read_group()?;
         if sg.group_id != "sensor_status" {
             return None;
         }
@@ -463,6 +502,40 @@ fn ang_diff(target: f32, current: f32) -> f32 {
 }
 
 // ----------------------------------------------------------------------------
+// Criterio de espera do LiDAR (puro, testavel sem rede/robo)
+// ----------------------------------------------------------------------------
+
+/// Minimo de scans que confirma que o LiDAR entrou em STREAMING. Um scan ja'
+/// prova que o motor esta girando e o daemon esta publicando; usamos 1 para
+/// nao somar latencia desnecessaria antes de comecar a dirigir.
+const LIDAR_MIN_SCANS: u64 = 1;
+
+/// Veredito da espera pelo LiDAR. Puro: depende so' de (scans vistos, tempo
+/// decorrido, timeout). Nao acessa rede nem relogio — o chamador e' quem mede.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LidarWait {
+    /// Ja' vimos scans suficientes: pode comecar a dirigir.
+    Ready,
+    /// Ainda sem scan, mas dentro do timeout: continuar esperando.
+    Wait,
+    /// Timeout estourado SEM nenhum scan: abortar SEM dirigir.
+    Abort,
+}
+
+/// Decide o que fazer com base no numero de scans vistos e no tempo decorrido.
+/// O scan "ganha" do timeout: se ja' houver scan, e' Ready mesmo que o tempo ja'
+/// tenha estourado (nao faz sentido abortar com o LiDAR ja' em streaming).
+fn lidar_ready(scans_seen: u64, elapsed: Duration, timeout: Duration) -> LidarWait {
+    if scans_seen >= LIDAR_MIN_SCANS {
+        LidarWait::Ready
+    } else if elapsed >= timeout {
+        LidarWait::Abort
+    } else {
+        LidarWait::Wait
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Controlador
 // ----------------------------------------------------------------------------
 
@@ -508,6 +581,13 @@ struct Args {
     /// nao as rodas - seguro em dry-run tambem.
     #[arg(long, default_value_t = 73)]
     lidar_pwm: i32,
+    /// Segundos maximos a esperar o LiDAR entrar em STREAMING (>=1 scan do grupo
+    /// `lidar`) antes de comandar as rodas. Vale nos modos de ODOMETRIA PURA
+    /// (`--straight-source odom` e giro-odom): o GD32 NAO sustenta as rodas sem
+    /// um componente ativo, entao dirigir antes do LiDAR subir = rodas paradas
+    /// (~1-2 s e param). Se estourar sem scan, ABORTA sem dirigir.
+    #[arg(long, default_value_t = 20.0)]
+    lidar_wait: f32,
     /// Modo giro: theta alvo em graus
     #[arg(long)]
     spin: Option<f32>,
@@ -674,6 +754,54 @@ impl Controller {
         eprintln!("-> drive zerado + DISABLE, LiDAR desligado");
     }
 
+    /// Espera o LiDAR entrar em STREAMING antes de comandar as rodas.
+    ///
+    /// O `lidar enable` (feito em `Controller::new`) leva ~10 s no daemon
+    /// (power cycle + spin-up + verificacao do stream). Nessa janela o GD32 nao
+    /// tem componente ativo e as RODAS NAO GIRAM (regra do dead-man: elas param
+    /// ~1-2 s depois sem LiDAR/escova/succao ativos). Este metodo le o stream UDP
+    /// 5555 pelo `SangamDirectReader` ate ver >=1 scan do grupo `lidar`, com
+    /// timeout. Se estourar sem scan, devolve `false` -> o chamador ABORTA SEM
+    /// DIRIGIR (nao anda as cegas). Ja' com o LiDAR em streaming, comeca a dirigir.
+    fn wait_lidar_stream(&mut self, timeout: Duration) -> bool {
+        // Sem o leitor direto nao ha' como confirmar o stream: aborta sem dirigir.
+        let Some(rd) = self.sangam_raw.as_mut() else {
+            eprintln!(
+                "!! sem sangam direct reader (porta {}) — nao da' p/ confirmar o LiDAR; \
+                 abortando SEM dirigir",
+                self.args.port_drive
+            );
+            return false;
+        };
+        let t0 = Instant::now();
+        eprintln!(
+            "-> aguardando o LiDAR entrar em STREAMING (>=1 scan, timeout {:.1}s) antes de dirigir...",
+            timeout.as_secs_f32()
+        );
+        loop {
+            rd.poll_scan();
+            let scans = rd.scans_seen();
+            match lidar_ready(scans, t0.elapsed(), timeout) {
+                LidarWait::Ready => {
+                    eprintln!(
+                        "-> LiDAR em streaming: {scans} scan(s) em {:.1}s — pode dirigir",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return true;
+                }
+                LidarWait::Abort => {
+                    eprintln!(
+                        "!! LiDAR NAO entrou em streaming em {:.1}s (0 scans vistos) — \
+                         ABORTANDO SEM DIRIGIR",
+                        timeout.as_secs_f32()
+                    );
+                    return false;
+                }
+                LidarWait::Wait => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+
     /// Le frames ate obter (pose, lidar). Retorna o mais recente dentro de timeout_ms.
     /// A pose vem por UDP (RobotStatus/SensorStatus); o mapa/response vem por TCP.
     fn latest(&mut self, budget_ms: u64) -> (Option<(f32, f32, f32)>, Option<dhruva::LidarScan>) {
@@ -770,6 +898,13 @@ impl Controller {
     /// captura o giro). Convenção empı́rica (giro 180°/02/10): giro positivo
     /// (anti-horário) → right+ / left−, e Δθ_rad = (ΔR − ΔL)/944.
     fn spin_odom(&mut self, target: f32, tol: f32, spin_rate: f32) -> bool {
+        // Espera o LiDAR entrar em STREAMING ANTES de comandar as rodas: sem
+        // componente ativo o GD32 nao sustenta o giro (rodas param em ~1-2 s).
+        // Se nao houver scan no timeout, aborta SEM dirigir.
+        let wait = Duration::from_secs_f32(self.args.lidar_wait);
+        if !self.wait_lidar_stream(wait) {
+            return false;
+        }
         let t0 = Instant::now();
         eprintln!("girando {:+}° por ODOMETRIA DE RODA (tol {:.1}°)", target.to_degrees(), self.args.tol);
         let mut acc: f32 = 0.0;         // rotacao acumulada (rad)
@@ -873,6 +1008,13 @@ impl Controller {
         if self.sangam_raw.is_none() {
             eprintln!("!! straight-odom exige o sangam direct reader (porta {}); abortando",
                       self.args.port_drive);
+            return false;
+        }
+        // Espera o LiDAR entrar em STREAMING ANTES de comandar as rodas: sem um
+        // componente ativo o GD32 nao sustenta as rodas (param em ~1-2 s). Se nao
+        // houver scan no timeout, aborta SEM dirigir (nao anda as cegas).
+        let wait = Duration::from_secs_f32(self.args.lidar_wait);
+        if !self.wait_lidar_stream(wait) {
             return false;
         }
         let t0 = Instant::now();
@@ -1087,5 +1229,55 @@ mod tests {
         o.update((5000, 5000)); // -5000 ticks = -1,1 m
         assert!(o.travelled() < 0.0);
         assert!(!o.reached(0.5));
+    }
+
+    // --- Criterio de espera do LiDAR (puro, sem rede/robo) ---
+
+    /// Com >=1 scan visto -> Ready (pode dirigir). Vale mesmo com 0s decorridos.
+    #[test]
+    fn lidar_ready_com_scan() {
+        assert_eq!(
+            lidar_ready(1, Duration::from_secs(0), Duration::from_secs(20)),
+            LidarWait::Ready
+        );
+        assert_eq!(
+            lidar_ready(5, Duration::from_secs(3), Duration::from_secs(20)),
+            LidarWait::Ready
+        );
+    }
+
+    /// Sem scan e DENTRO do timeout -> Wait (continua esperando).
+    #[test]
+    fn lidar_sem_scan_no_prazo() {
+        assert_eq!(
+            lidar_ready(0, Duration::from_secs(0), Duration::from_secs(20)),
+            LidarWait::Wait
+        );
+        assert_eq!(
+            lidar_ready(0, Duration::from_secs(19), Duration::from_secs(20)),
+            LidarWait::Wait
+        );
+    }
+
+    /// Sem scan e timeout ESTOURADO -> Abort (aborta SEM dirigir).
+    #[test]
+    fn lidar_sem_scan_timeout() {
+        assert_eq!(
+            lidar_ready(0, Duration::from_secs(20), Duration::from_secs(20)),
+            LidarWait::Abort
+        );
+        assert_eq!(
+            lidar_ready(0, Duration::from_secs(25), Duration::from_secs(20)),
+            LidarWait::Abort
+        );
+    }
+
+    /// O scan "ganha" do timeout: ja' houve scan -> Ready mesmo apos o prazo.
+    #[test]
+    fn lidar_scan_ganha_do_timeout() {
+        assert_eq!(
+            lidar_ready(1, Duration::from_secs(30), Duration::from_secs(20)),
+            LidarWait::Ready
+        );
     }
 }
