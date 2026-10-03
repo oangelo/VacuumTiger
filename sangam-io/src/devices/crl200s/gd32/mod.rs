@@ -128,6 +128,15 @@ impl GD32Driver {
         })
     }
 
+    /// Attach the lidar driver's scan counter, so `lidar enable` can verify that the
+    /// sensor really entered streaming (see `ComponentState::attach_lidar_scan_counter`).
+    pub fn attach_lidar_scan_counter(
+        &self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.component_state.attach_lidar_scan_counter(counter);
+    }
+
     /// Initialize the GD32 device by sending init commands
     ///
     /// Version is requested by reader thread after first packet received.

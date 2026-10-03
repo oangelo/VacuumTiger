@@ -138,6 +138,12 @@ impl DeviceDriver for CRL200SDriver {
             hardware.lidar_mounting.clone(),
         );
         lidar.start(lidar_data)?;
+        // Sinal de vida para a verificação do `enable` (issue #14): o contador de scans do
+        // driver do LiDAR é anexado ao estado dos componentes. Sem scan nenhum, o enable
+        // agora falha explicitamente e refaz o ciclo, em vez de logar "OK" em silêncio.
+        if let Some(gd32) = &self.gd32 {
+            gd32.attach_lidar_scan_counter(lidar.scan_counter());
+        }
         self.lidar = Some(lidar);
         log::info!("Lidar driver started (motor OFF - enable via command)");
 

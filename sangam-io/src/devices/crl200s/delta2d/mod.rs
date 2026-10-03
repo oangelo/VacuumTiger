@@ -122,6 +122,14 @@ impl Delta2DDriver {
         }
     }
 
+    /// Scan counter published by the reader thread (one per parsed scan).
+    ///
+    /// Exposed so the GD32 command path can verify that a `lidar enable` actually
+    /// produced streaming instead of trusting the frame sequence alone.
+    pub fn scan_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.scan_count)
+    }
+
     /// Start the lidar reader thread
     pub fn start(&mut self, sensor_data: Arc<Mutex<SensorGroupData>>) -> Result<()> {
         // Open serial port

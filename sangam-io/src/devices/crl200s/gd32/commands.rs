@@ -80,6 +80,23 @@ const LIDAR_SPINUP_FRAMES: u32 = 125;
 const LIDAR_SPINUP_PWM: u8 = 100;
 /// Interval between spin-up frames, in milliseconds (matches the 50 Hz refresh)
 const LIDAR_SPINUP_INTERVAL_MS: u64 = 20;
+/// Pause after the navigation-mode frame, before anything else (ms).
+/// The GD32 reconfigures internal state after a mode switch; the `MODE_SWITCH_DELAY_MS`
+/// doc in heartbeat.rs already said 100 ms for this.
+const MODE_SWITCH_PAUSE_MS: u64 = 100;
+/// Gap between the frames of the start burst (ms) — measured at ~20 ms on this unit.
+const LIDAR_BURST_GAP_MS: u64 = 20;
+/// How many times `lidar enable` redoes the whole power cycle before giving up.
+/// Measured 2026-10-03: the first cold enable (robot idle in factory for hours) can
+/// deliver zero scans while the daemon logs a successful spin-up — the old code never
+/// checked, so it failed silently. Each attempt redoes the real rail cycle.
+const LIDAR_START_ATTEMPTS: u32 = 3;
+/// How long to wait for the first scan after the spin-up before declaring the attempt
+/// failed (ms). The driver publishes partial scans, and a healthy sensor delivers the
+/// first scan ~3.4 s after the enable (measured, 8/8 and 22/22 runs).
+const LIDAR_VERIFY_TIMEOUT_MS: u64 = 8000;
+/// Poll interval while waiting for the scan counter to advance (ms).
+const LIDAR_VERIFY_POLL_MS: u64 = 100;
 /// How long the lidar power rail stays off during the mandatory power cycle (ms).
 /// The Delta-2D only restarts streaming after a real power cycle; 2 s was enough on
 /// the bench (toggling GPIO 233 for ~2 s brought the stream back at ~7.6 KB/s).
@@ -502,6 +519,65 @@ fn handle_led(
 /// PWM is controlled exclusively by sangamio.toml configuration.
 /// Upstream clients cannot change lidar speed - SangamIO determines
 /// optimal speed based on hardware characteristics.
+/// Steps of `lidar enable`, in the order that works.
+///
+/// Extracted as a constant precisely because the ORDER is what was broken: until
+/// 2026-10-03 the rail OFF (`0x97 00`) was sent BEFORE the navigation mode (`0x65 02`),
+/// and the GD32 ignores `0xA2/0x97/0x71` outside navigation mode — so on a cold start
+/// the OFF was swallowed, no real power cycle happened, and the Delta-2D never left
+/// standstill (measured: 0 scans for 25 s, while the same enable after a full cycle
+/// worked).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum LidarStartStep {
+    /// `0x65 02` — must come first, otherwise the GD32 ignores the lidar frames.
+    ModeNav,
+    /// `0x97 00` — real rail OFF (only honored with navigation mode latched).
+    RailOff,
+    /// `0xA2` prep payload.
+    Prep,
+    /// `0x97 01` — rail ON.
+    RailOn,
+    /// `0x9D 01` — start.
+    Start,
+    /// Spin-up at 100% (the motor does not leave standstill below that).
+    SpinUp,
+    /// Settle at the configured PWM; the heartbeat keeps refreshing it.
+    Regime,
+}
+
+/// The `lidar enable` sequence. Order matters — see [`LidarStartStep`].
+pub(crate) const LIDAR_START_PLAN: &[LidarStartStep] = &[
+    LidarStartStep::ModeNav,
+    LidarStartStep::RailOff,
+    LidarStartStep::Prep,
+    LidarStartStep::RailOn,
+    LidarStartStep::Start,
+    LidarStartStep::SpinUp,
+    LidarStartStep::Regime,
+];
+
+/// Waits for the lidar scan counter to advance past `baseline`.
+///
+/// Returns true as soon as the counter moves (the sensor streamed at least one scan),
+/// false if it does not move within `timeout_ms`. This is the liveness check that turns
+/// a silent enable failure into a detected one.
+pub(crate) fn wait_for_scan(
+    counter: &std::sync::atomic::AtomicU64,
+    baseline: u64,
+    timeout_ms: u64,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if counter.load(std::sync::atomic::Ordering::Relaxed) > baseline {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(LIDAR_VERIFY_POLL_MS));
+    }
+}
+
 fn handle_lidar(
     port: &Arc<Mutex<Box<dyn SerialPort>>>,
     component_state: &Arc<ComponentState>,
@@ -516,63 +592,113 @@ fn handle_lidar(
 
             log::debug!("Lidar enable (PWM={}% from config)", pwm);
 
-            // SEQUENCIA COMPROVADA EM BANCADA (01/10/2026).
+            // ORDEM CORRIGIDA (03/10/2026) + VERIFICACAO DO STREAM. Ver `LidarStartStep`.
             //
-            // A rajada atomica de fabrica (reproduzida aqui ate o build anterior) NAO parte
-            // o motor nesta unidade: medido, o daemon entregou ~58 pontos em 44 s enquanto o
-            // instrumento cru (`lidar_init_test`, mesma bancada, ttyS1 so para ele) entregou
-            // **1408 B/s sustentados por 20 s**. A diferenca esta na sequencia:
+            // Antes: `0x97 00` (OFF) era mandado ANTES do `0x65 02` (modo navegacao).
+            // Como o GD32 ignora `0xA2/0x97/0x71` fora do modo navegacao, num start a frio
+            // o OFF era engolido -> sem OFF real -> `0x97 01` sozinho nao recria o ciclo do
+            // trilho (medido 01/10) -> o sensor nao saia da inercia. O daemon logava
+            // "spin-up concluido" e nao entregava scan nenhum (falha silenciosa).
             //
-            //   0x65 02 -> 0xA2 -> 0x97 01 -> 0x9D 01, com ~20 ms entre os frames
-            //   (o GD32 precisa desse intervalo para processar; o comentario de
-            //    MODE_SWITCH_DELAY_MS em heartbeat.rs ja dizia 100 ms apos o modo 0x02)
-            //   -> 1,2 s de 71 100 alternado com 66 (0,0) para sair da inercia
-            //   -> regime mantido pelo thread de heartbeat (71 <pwm> a 20 ms)
-            //
-            // O `0x97 00` NAO se manda: o ciclo do trilho (GPIO 233) e o GD32 quem faz.
-            // *** CORRIGIDO 02/10: o `0x97 01` SOZINHO NAO PROVA POWER. Medido na bancada:
-            // o Delta-2D so (re)comeca a transmitir (ttyS1 ~7,8 KB/s) depois de um ciclo
-            // REAL no trilho (off -> ~2 s -> on). O instrumento cru (`lidar_init_test`)
-            // entrega 7,8 KB/s sustentados quando chaveia o trilho; o enable sem o OFF
-            // anterior deixa o ttyS1 em 0 byte (o motor assinala spin-up mas o sensor
-            // nao manda dados). Aqui fazemos o ciclo EXPLICITO: 0x97 00 -> wait -> 0x97 01.
-            pkt.set_lidar_power(false);
-            send_packet(port, pkt)?;
-            thread::sleep(Duration::from_millis(2000));
+            // Agora: modo navegacao PRIMEIRO, depois o OFF real, depois a rajada; e o enable
+            // CONFERE se o sensor entrou em streaming (contador de scans do driver do LiDAR),
+            // refazendo o ciclo ate `LIDAR_START_ATTEMPTS` vezes. Sem scan nenhum, devolve
+            // erro em vez de mentir "OK".
+            let counter = component_state.lidar_scan_counter();
 
-            pkt.set_motor_mode(0x02);
-            send_packet(port, pkt)?;
-            thread::sleep(Duration::from_millis(20));
+            for attempt in 1..=LIDAR_START_ATTEMPTS {
+                if attempt > 1 {
+                    log::warn!(
+                        "Lidar enable: refazendo o ciclo (tentativa {}/{})",
+                        attempt,
+                        LIDAR_START_ATTEMPTS
+                    );
+                }
 
-            pkt.set_imu_calibrate_state(&IMU_DEFAULT_PAYLOAD);
-            send_packet(port, pkt)?;
-            thread::sleep(Duration::from_millis(20));
+                for step in LIDAR_START_PLAN {
+                    match step {
+                        LidarStartStep::ModeNav => {
+                            // 0x65 02 primeiro: e o que faz o GD32 aceitar os frames de LiDAR.
+                            pkt.set_motor_mode(0x02);
+                            send_packet(port, pkt)?;
+                            thread::sleep(Duration::from_millis(MODE_SWITCH_PAUSE_MS));
+                        }
+                        LidarStartStep::RailOff => {
+                            // OFF real do trilho. So vale com o modo navegacao latcheado.
+                            pkt.set_lidar_power(false);
+                            send_packet(port, pkt)?;
+                            thread::sleep(Duration::from_millis(LIDAR_POWER_CYCLE_OFF_MS));
+                        }
+                        LidarStartStep::Prep => {
+                            pkt.set_imu_calibrate_state(&IMU_DEFAULT_PAYLOAD);
+                            send_packet(port, pkt)?;
+                            thread::sleep(Duration::from_millis(LIDAR_BURST_GAP_MS));
+                        }
+                        LidarStartStep::RailOn => {
+                            pkt.set_lidar_power(true);
+                            send_packet(port, pkt)?;
+                            thread::sleep(Duration::from_millis(LIDAR_BURST_GAP_MS));
+                        }
+                        LidarStartStep::Start => {
+                            pkt.set_lidar_start();
+                            send_packet(port, pkt)?;
+                            thread::sleep(Duration::from_millis(LIDAR_BURST_GAP_MS));
+                        }
+                        LidarStartStep::SpinUp => {
+                            for _ in 0..LIDAR_SPINUP_FRAMES {
+                                pkt.set_lidar_pwm(LIDAR_SPINUP_PWM);
+                                send_packet(port, pkt)?;
+                                pkt.set_velocity(0, 0);
+                                send_packet(port, pkt)?;
+                                thread::sleep(Duration::from_millis(LIDAR_SPINUP_INTERVAL_MS));
+                            }
+                            log::info!("Lidar spin-up concluido (PWM {}%)", LIDAR_SPINUP_PWM);
+                        }
+                        LidarStartStep::Regime => {
+                            // Ligado: o thread de heartbeat passa a refrescar o `0x71` a 20 ms,
+                            // como a fabrica faz a ~50 Hz.
+                            component_state.lidar_enabled.store(true, Ordering::Relaxed);
+                            pkt.set_lidar_pwm(pwm);
+                            send_packet(port, pkt)?;
+                        }
+                    }
+                }
 
-            pkt.set_lidar_power(true);
-            send_packet(port, pkt)?;
-            thread::sleep(Duration::from_millis(20));
+                let Some(counter) = counter.as_ref() else {
+                    // Sem contador anexado (mocks/testes): nada a verificar, comportamento antigo.
+                    log::debug!("Lidar enable: sem contador de scans anexado - sem verificacao");
+                    return Ok(());
+                };
 
-            pkt.set_lidar_start();
-            send_packet(port, pkt)?;
-            thread::sleep(Duration::from_millis(20));
+                let before = counter.load(Ordering::Relaxed);
+                if wait_for_scan(counter, before, LIDAR_VERIFY_TIMEOUT_MS) {
+                    log::info!(
+                        "Lidar enable OK (tentativa {}/{}): sensor em streaming (PWM {}%)",
+                        attempt,
+                        LIDAR_START_ATTEMPTS,
+                        pwm
+                    );
+                    return Ok(());
+                }
 
-            for _ in 0..LIDAR_SPINUP_FRAMES {
-                pkt.set_lidar_pwm(LIDAR_SPINUP_PWM);
-                send_packet(port, pkt)?;
-                pkt.set_velocity(0, 0);
-                send_packet(port, pkt)?;
-                thread::sleep(Duration::from_millis(LIDAR_SPINUP_INTERVAL_MS));
+                log::warn!(
+                    "Lidar enable: nenhum scan em {} ms (tentativa {}/{}) - sensor mudo",
+                    LIDAR_VERIFY_TIMEOUT_MS,
+                    attempt,
+                    LIDAR_START_ATTEMPTS
+                );
+                component_state.lidar_enabled.store(false, Ordering::Relaxed);
             }
-            log::info!("Lidar spin-up concluido (PWM {}%)", LIDAR_SPINUP_PWM);
 
-            // Ligado: o thread de heartbeat passa a refrescar o `0x71` a 20 ms, como a
-            // fabrica faz a ~50 Hz. O GD32 devolve o trilho ~2,2 s depois, por conta dele.
-            component_state.lidar_enabled.store(true, Ordering::Relaxed);
-
-            pkt.set_lidar_pwm(pwm);
-            send_packet(port, pkt)?;
-
-            Ok(())
+            log::error!(
+                "Lidar enable FALHOU apos {} tentativas: nenhum scan. Checar sensor/trilho \
+                 (esta falha NAO e mais silenciosa - vai para o cliente).",
+                LIDAR_START_ATTEMPTS
+            );
+            Err(Error::Other(format!(
+                "lidar enable failed: no scans after {} attempts",
+                LIDAR_START_ATTEMPTS
+            )))
         }
         ComponentAction::Disable { .. } => {
             log::debug!("Lidar disable");
@@ -783,5 +909,56 @@ fn handle_mcu(
             "MCU only supports Enable/Disable/Reset, got {:?}",
             action
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regressão do bug medido em 03/10/2026: o OFF do trilho (`0x97 00`) era mandado
+    /// ANTES do modo navegação (`0x65 02`), e o GD32 ignora os frames de LiDAR fora do
+    /// modo navegação — no start a frio o OFF era engolido, não havia ciclo real do
+    /// trilho e o sensor não saía da inércia (0 scans em 25 s, medido).
+    #[test]
+    fn lidar_start_plan_puts_nav_mode_before_rail_off() {
+        let plan = LIDAR_START_PLAN;
+        let pos = |s: LidarStartStep| {
+            plan.iter()
+                .position(|x| *x == s)
+                .unwrap_or_else(|| panic!("passo {:?} ausente no plano", s))
+        };
+        assert_eq!(plan[0], LidarStartStep::ModeNav, "modo navegacao tem que ser o 1o");
+        assert!(pos(LidarStartStep::ModeNav) < pos(LidarStartStep::RailOff));
+        assert!(pos(LidarStartStep::RailOff) < pos(LidarStartStep::Prep));
+        assert!(pos(LidarStartStep::Prep) < pos(LidarStartStep::RailOn));
+        assert!(pos(LidarStartStep::RailOn) < pos(LidarStartStep::Start));
+        assert!(pos(LidarStartStep::Start) < pos(LidarStartStep::SpinUp));
+        assert!(pos(LidarStartStep::SpinUp) < pos(LidarStartStep::Regime));
+        assert_eq!(plan.len(), 7, "plano completo: sem passo extra/perdido");
+    }
+
+    /// A verificação é o que mata a falha silenciosa: sem scan, o enable tem que falhar.
+    #[test]
+    fn wait_for_scan_times_out_when_counter_is_stuck() {
+        let counter = std::sync::atomic::AtomicU64::new(42);
+        assert!(
+            !wait_for_scan(&counter, 42, 150),
+            "contador parado -> tempo esgotado -> false (enable vai falhar e repetir)"
+        );
+    }
+
+    #[test]
+    fn wait_for_scan_returns_true_as_soon_as_counter_advances() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(42));
+        assert!(wait_for_scan(&counter, 41, 150), "contador ja adiantado -> true");
+        assert!(!wait_for_scan(&counter, 42, 100), "baseline no valor atual -> espera e falha");
+        let c = std::sync::Arc::clone(&counter);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert!(wait_for_scan(&counter, 42, 300), "contador andou durante a espera -> true");
+        handle.join().unwrap();
     }
 }

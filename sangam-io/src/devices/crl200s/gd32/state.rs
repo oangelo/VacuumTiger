@@ -4,7 +4,7 @@
 //! component commands every 20ms. All fields use atomic types to allow lockless reads.
 
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// Epoch instant for the monotonic clock used by the dead-man switch.
@@ -61,6 +61,12 @@ pub struct ComponentState {
     /// Whether the dead-man tripped (for observability only - the stop itself
     /// is performed by the heartbeat once it sees the staleness).
     pub deadman_tripped: AtomicBool,
+    /// Scan counter of the lidar driver, attached once at device init.
+    ///
+    /// Used by `lidar enable` to verify that the sensor actually entered streaming
+    /// instead of trusting the frame sequence (measured 2026-10-03: a cold enable can
+    /// log "spin-up concluido" and deliver zero scans — a silent failure).
+    lidar_scan_counter: OnceLock<Arc<AtomicU64>>,
 }
 
 impl ComponentState {
@@ -80,6 +86,7 @@ impl ComponentState {
             last_drive_cmd_ms: AtomicU64::new(0),
             deadman_timeout_ms: AtomicU64::new(deadman_timeout_ms.max(100)),
             deadman_tripped: AtomicBool::new(false),
+            lidar_scan_counter: OnceLock::new(),
         }
     }
 
@@ -174,6 +181,20 @@ impl ComponentState {
     /// Get current lidar PWM value (set from config during initialization)
     pub fn get_lidar_pwm(&self) -> u8 {
         self.lidar_pwm.load(Ordering::Relaxed)
+    }
+
+    /// Attach the lidar driver's scan counter (the liveness signal used by
+    /// `lidar enable` to check that the sensor really entered streaming).
+    ///
+    /// Called once during device initialization, after both drivers are created.
+    /// Returns false if a counter was already attached (attach-once semantics).
+    pub fn attach_lidar_scan_counter(&self, counter: Arc<AtomicU64>) -> bool {
+        self.lidar_scan_counter.set(counter).is_ok()
+    }
+
+    /// The attached lidar scan counter, if any.
+    pub fn lidar_scan_counter(&self) -> Option<Arc<AtomicU64>> {
+        self.lidar_scan_counter.get().cloned()
     }
 }
 
