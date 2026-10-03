@@ -546,9 +546,16 @@ pub(crate) enum LidarStartStep {
 }
 
 /// The `lidar enable` sequence. Order matters — see [`LidarStartStep`].
+///
+/// 2026-10-03 (tarde): the `RailOff` step was REMOVED from this plan. The raw bench
+/// instrument (`lidar_init_test` mode `a`) proves the sensor starts reliably with
+/// `65 02 -> A2 -> 97 01 -> 9D 01` and NO explicit `97 00`: it streamed 100.9 KB from a
+/// cold idle in two independent runs, while the daemon enable *with* the `97 00` step
+/// stayed silent (4/4 mute with retry). The GD32 latches the rail in a state the
+/// `97 01` cannot recover from when an explicit `97 00` is injected mid-sequence on a
+/// cold start.
 pub(crate) const LIDAR_START_PLAN: &[LidarStartStep] = &[
     LidarStartStep::ModeNav,
-    LidarStartStep::RailOff,
     LidarStartStep::Prep,
     LidarStartStep::RailOn,
     LidarStartStep::Start,
