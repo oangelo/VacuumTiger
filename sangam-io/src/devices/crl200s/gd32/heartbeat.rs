@@ -137,6 +137,10 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
     // Ver `CORTE_RODAS.md`.
     let brush_keepalive_interval = DRIVE_BRUSH_KEEPALIVE_INTERVAL_MS / interval_ms;
     let mut brush_keepalive_counter: u64 = 0;
+    // O keep-alive segurou a escova num ciclo anterior (0x6A=30). Quando o robô
+    // PARAR de dirigir e o cliente NAO pediu escova, precisamos mandar 0x6A=0
+    // para desligar — senao o GD32 segura o ultimo 0x6A (escova fica girando).
+    let mut brush_keepalive_active = false;
 
     // Deadline-based heartbeating: sleep until the *next* tick boundary instead of
     // a fixed sleep *after* the work. A fixed `sleep(interval_ms)` after sending
@@ -337,6 +341,21 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
                             DRIVE_BRUSH_KEEPALIVE_SPEED
                         );
                     }
+                    brush_keepalive_active = true;
+                }
+            } else if brush_keepalive_active && main_brush == 0 {
+                // Parou de dirigir e o keep-alive era o único dono da escova:
+                // desligar explicitamente (0x6A=0). Fix do achado 04/10 — sem isso o
+                // GD32 segura o último 0x6A=30 e a escova fica girando com o robô
+                // parado.
+                brush_keepalive_active = false;
+                pkt.set_main_brush(0);
+                if let Err(e) = pkt.send_to(&mut *port) {
+                    log::error!("Drive brush keep-alive OFF (0x6A=0) send failed: {}", e);
+                } else {
+                    log::info!(
+                        "Drive brush keep-alive OFF (0x6A=0) - fim da tração"
+                    );
                 }
             }
         } else {
@@ -385,6 +404,7 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::crl200s::constants::CMD_MAIN_BRUSH;
     use std::io::Write;
 
     /// Write sink that records every byte the heartbeat loop emits, so a test
@@ -567,6 +587,73 @@ mod tests {
         assert!(
             !nonzero,
             "bumper com robô parado nao deve gerar velocidade != 0 (nao infla passo)"
+        );
+    }
+
+    /// Fix do achado 04/10 (issue #18): durante a tração contínua o keep-alive
+    /// manda 0x6A=30 (escova de fundo) para o GD32 não cortar as rodas; quando o
+    /// robô PARA e o cliente não pediu escova, precisa mandar 0x6A=0 para
+    /// desligar — senão o GD32 segura o último 0x6A e a escova fica girando com o
+    /// robô parado. Este teste roda o heartbeat dirigindo (~1.1s, dispara o
+    /// keep-alive), depois zera a velocidade e verifica que um frame 0x6A=0 é
+    /// emitido após o 0x6A=30.
+    #[test]
+    fn brush_keepalive_off_sent_when_driving_stops() {
+        let state = Arc::new(ComponentState::new(73, 100_000)); // deadman longo: nao interfere
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.linear_velocity.store(2242, Ordering::Relaxed); // ~0.5 m/s
+        state.note_drive_command();
+
+        let rec = RecordingWriter::default();
+        let bytes = Arc::clone(&rec.bytes);
+        let port = Arc::new(Mutex::new(rec));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let h = {
+            let port = Arc::clone(&port);
+            let shutdown = Arc::clone(&shutdown);
+            let st = Arc::clone(&state);
+            thread::spawn(move || heartbeat_loop(port, shutdown, 20, st))
+        };
+
+        // Deixa o keep-alive disparar (intervalo ~1s; margem p/ um ciclo).
+        thread::sleep(Duration::from_millis(1150));
+
+        // Para o robô (0,0): o keep-alive deve mandar 0x6A=0 ao sair de driving.
+        state.linear_velocity.store(0, Ordering::Relaxed);
+        state.angular_velocity.store(0, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(150));
+
+        shutdown.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+
+        let bytes = bytes.lock().unwrap().clone();
+        let frames = parse_frames(&bytes);
+        let brush_frames: Vec<u8> = frames
+            .iter()
+            .filter(|(cmd, _)| *cmd == CMD_MAIN_BRUSH)
+            .map(|(_, p)| p[0])
+            .collect();
+
+        assert!(
+            brush_frames.iter().any(|&s| s == DRIVE_BRUSH_KEEPALIVE_SPEED),
+            "durante a tracao deve ter 0x6A={} (keep-alive). frames 0x6A={:?}",
+            DRIVE_BRUSH_KEEPALIVE_SPEED,
+            brush_frames
+        );
+        assert!(
+            brush_frames.iter().any(|&s| s == 0),
+            "ao parar o robô deve vir 0x6A=0 (desligar escova colada). frames 0x6A={:?}",
+            brush_frames
+        );
+        // Garante que o 0 vem DEPOIS do keep-alive (nao antes).
+        let last_ka = brush_frames
+            .iter()
+            .rposition(|&s| s == DRIVE_BRUSH_KEEPALIVE_SPEED);
+        let last_zero = brush_frames.iter().rposition(|&s| s == 0);
+        assert!(
+            last_zero.unwrap_or(0) > last_ka.unwrap_or(usize::MAX),
+            "o 0x6A=0 deve ser emitido depois do ultimo 0x6A=30. frames 0x6A={:?}",
+            brush_frames
         );
     }
 }
