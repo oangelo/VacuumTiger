@@ -72,6 +72,21 @@ pub struct ComponentState {
     /// Whether the dead-man tripped (for observability only - the stop itself
     /// is performed by the heartbeat once it sees the staleness).
     pub deadman_tripped: AtomicBool,
+    /// Bumper flags, set by the reader from the status packet, read by the
+    /// heartbeat for the collision hard-stop (issue #18, R2).
+    ///
+    /// Non-zero when any bumper is pressed. The heartbeat stops the wheels in
+    /// <200 ms when this is set while moving (BUMPER-STOP), without tripping the
+    /// DEAD-MAN. Masked by the reader against the dock/charging signature that
+    /// reads as "both bumpers" on the base.
+    pub bumper_pressed: AtomicBool,
+    /// Raw left bumper flag (not dock-masked), for the BUMPER-STOP log.
+    pub bumper_left: AtomicBool,
+    /// Raw right bumper flag (not dock-masked), for the BUMPER-STOP log.
+    pub bumper_right: AtomicBool,
+    /// True when the reader last saw the robot on the dock/charging. Used to
+    /// mask bumper false-positives (the dock contact reads as bumper flags).
+    pub is_dock_connected: AtomicBool,
     /// Scan counter of the lidar driver, attached once at device init.
     ///
     /// Used by `lidar enable` to verify that the sensor actually entered streaming
@@ -98,6 +113,10 @@ impl ComponentState {
             deadman_timeout_ms: AtomicU64::new(deadman_timeout_ms.max(100)),
             lidar_rail_off_settle_ms: AtomicU64::new(DEFAULT_LIDAR_RAIL_OFF_SETTLE_MS),
             deadman_tripped: AtomicBool::new(false),
+            bumper_pressed: AtomicBool::new(false),
+            bumper_left: AtomicBool::new(false),
+            bumper_right: AtomicBool::new(false),
+            is_dock_connected: AtomicBool::new(false),
             lidar_scan_counter: OnceLock::new(),
         }
     }

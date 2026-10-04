@@ -156,7 +156,7 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
         // Check component states
         let (vacuum, main_brush, side_brush, water_pump) = component_state.get_component_speeds();
         let lidar_enabled = component_state.lidar_enabled.load(Ordering::Relaxed);
-        let (linear, angular) = component_state.get_velocities();
+        let (mut linear, mut angular) = component_state.get_velocities();
 
         // Motor mode is needed if any component is active OR wheel motor is explicitly enabled
         let any_component_active = component_state.any_active();
@@ -242,6 +242,36 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
                 drop(port);
                 thread::sleep(Duration::from_millis(interval_ms));
                 continue;
+            }
+
+            // =========================================================
+            // BUMPER HARD-STOP (issue #18, R2)
+            // =========================================================
+            // Colisão durante a marcha -> parada imediata (<200ms), sem passar
+            // pelo DEAD-MAN. O reader publica `bumper_pressed` já mascarado por
+            // dock (criterio D: sem falso-positivo na base). Só freia se o robo
+            // estiver de fato se movendo (senão o bumper pressionado não infla
+            // a distância nem gera log repetido). A flag docked estando true
+            // mascarou o bumper no reader -> aqui nunca trava na base.
+            if component_state.bumper_pressed.load(Ordering::Relaxed)
+                && (linear != 0 || angular != 0)
+            {
+                log::warn!(
+                    "BUMPER-STOP L={} R={}: parando rodas (velocidade estava {:?})",
+                    component_state.bumper_left.load(Ordering::Relaxed),
+                    component_state.bumper_right.load(Ordering::Relaxed),
+                    component_state.get_velocities()
+                );
+                component_state.linear_velocity.store(0, Ordering::Relaxed);
+                component_state.angular_velocity.store(0, Ordering::Relaxed);
+                component_state.wheel_motor_enabled.store(false, Ordering::Relaxed);
+                pkt.set_velocity(0, 0);
+                if let Err(e) = pkt.send_to(&mut *port) {
+                    log::error!("BUMPER-STOP velocity send failed: {}", e);
+                }
+                // Recompute the locals for the rest of this cycle (0,0).
+                linear = 0;
+                angular = 0;
             }
 
             // Motor mode 0x02 active - send velocity command as heartbeat
@@ -485,6 +515,58 @@ mod tests {
             Some(&0x02),
             "após sair para 0x00 não pode voltar para 0x02. modos={:?}",
             modes
+        );
+    }
+
+    /// BUMPER HARD-STOP (issue #18, R2): com o robô se movendo e o bumper
+    /// pressionado, o heartbeat para as rodas (`0x66 0,0`) SEM depender do
+    /// dead-man. Dead-man com timeout longo (não expira neste janela) prova que
+    /// a parada veio do bumper, não do dead-man.
+    #[test]
+    fn bumper_pressed_while_moving_zeroes_wheels() {
+        let state = Arc::new(ComponentState::new(73, 100_000)); // dead-man so expira em 100s
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.linear_velocity.store(4483, Ordering::Relaxed); // ~1 m/s
+        state.note_drive_command(); // re-arma o dead-man -> nao expira
+        state.bumper_left.store(true, Ordering::Relaxed); // colisao L
+        state
+            .bumper_pressed
+            .store(true, Ordering::Relaxed); // reader mascarou dock -> ativo
+
+        let frames = run_heartbeat(state, 300);
+
+        let stopped = frames.iter().any(|(cmd, p)| {
+            *cmd == 0x66
+                && p.len() == 8
+                && i32::from_le_bytes([p[0], p[1], p[2], p[3]]) == 0
+                && i32::from_le_bytes([p[4], p[5], p[6], p[7]]) == 0
+        });
+        assert!(stopped, "bumper pressionado com marcha deve parar as rodas via 0x66 0,0");
+    }
+
+    /// O bumper pressão com o robô PARADO não gera comando de parada extra que
+    /// inflaria o passo — a velocidade já é 0 e o bounce do bumper não se
+    /// transforma em movimento.
+    #[test]
+    fn bumper_pressed_while_idle_keeps_wheels_stopped() {
+        let state = Arc::new(ComponentState::new(73, 100_000));
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.bumper_right.store(true, Ordering::Relaxed);
+        state
+            .bumper_pressed
+            .store(true, Ordering::Relaxed);
+
+        let frames = run_heartbeat(state, 200);
+        // Robo parado: nao deve haver frame de velocidade != 0 (nada para as
+        // rodas a mover). Qualquer 0x66 presente deve ser 0,0.
+        let nonzero = frames.iter().any(|(cmd, p)| {
+            *cmd == 0x66
+                && (i32::from_le_bytes([p[0], p[1], p[2], p[3]]) != 0
+                    || i32::from_le_bytes([p[4], p[5], p[6], p[7]]) != 0)
+        });
+        assert!(
+            !nonzero,
+            "bumper com robô parado nao deve gerar velocidade != 0 (nao infla passo)"
         );
     }
 }

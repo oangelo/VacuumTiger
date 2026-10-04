@@ -11,6 +11,7 @@
 
 use super::packet::version_request_packet;
 use super::protocol::{PacketReader, RxPacket};
+use super::state::ComponentState;
 use crate::config::AxisTransform3D;
 use crate::core::types::{SensorGroupData, SensorValue, StreamSender};
 use crate::devices::crl200s::constants::{
@@ -66,6 +67,7 @@ pub(super) fn reader_loop(
     stream_tx: Option<StreamSender>,
     gyro_transform: AxisTransform3D,
     accel_transform: AxisTransform3D,
+    component_state: &Arc<ComponentState>,
 ) {
     let mut reader = PacketReader::new();
     let mut version_requested = false;
@@ -129,6 +131,7 @@ pub(super) fn reader_loop(
                         &sensor_data,
                         &gyro_transform,
                         &accel_transform,
+                        component_state,
                     )
                 {
                     // Push to streaming channel if available (for 110Hz TCP streaming)
@@ -214,6 +217,7 @@ fn handle_status_packet(
     sensor_data: &Arc<Mutex<SensorGroupData>>,
     gyro_transform: &AxisTransform3D,
     accel_transform: &AxisTransform3D,
+    component_state: &Arc<ComponentState>,
 ) -> Option<SensorGroupData> {
     // Update shared data directly (no allocations)
     let Ok(mut data) = sensor_data.lock() else {
@@ -265,14 +269,29 @@ fn handle_status_packet(
     );
 
     // Bumpers
-    data.set(
-        "bumper_left",
-        SensorValue::Bool((payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_LEFT) != 0),
-    );
-    data.set(
-        "bumper_right",
-        SensorValue::Bool((payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_RIGHT) != 0),
-    );
+    let bump_l = (payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_LEFT) != 0;
+    let bump_r = (payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_RIGHT) != 0;
+    data.set("bumper_left", SensorValue::Bool(bump_l));
+    data.set("bumper_right", SensorValue::Bool(bump_r));
+
+    // Charging/dock state (read out of the same status packet for the bumper mask).
+    let docked =
+        (payload[OFFSET_CHARGING_FLAGS] & FLAG_DOCK_CONNECTED) != 0;
+
+    // Bumper interlock state for the heartbeat (issue #18, R2): publica os crus
+    // (p/ o log) e o mascarado (p/ o hard-stop). Na base a fábrica le as duas
+    // bordas como bumpers (0x06 = L|R) por causa do contato; se docked,
+    // mascaramos para nao parar o robo na base (criterio D).
+    component_state
+        .is_dock_connected
+        .store(docked, Ordering::Relaxed);
+    component_state.bumper_left.store(bump_l, Ordering::Relaxed);
+    component_state
+        .bumper_right
+        .store(bump_r, Ordering::Relaxed);
+    component_state
+        .bumper_pressed
+        .store((bump_l || bump_r) && !docked, Ordering::Relaxed);
 
     // Wheel encoders
     data.set(

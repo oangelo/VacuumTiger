@@ -219,6 +219,7 @@ impl GD32Driver {
         // Start reader thread
         let reader_shutdown = Arc::clone(&shutdown);
         let reader_port = Arc::clone(&port);
+        let reader_components = Arc::clone(&component_state);
         self.reader_handle = Some(
             thread::Builder::new()
                 .name("gd32-reader".to_string())
@@ -231,6 +232,7 @@ impl GD32Driver {
                         stream_tx,
                         gyro_transform,
                         accel_transform,
+                        &reader_components,
                     );
                 })
                 .map_err(|e| Error::Other(format!("Failed to spawn reader thread: {}", e)))?,
