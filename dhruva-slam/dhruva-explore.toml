@@ -1,12 +1,9 @@
-# dhruva-slam ONBOARD na Rosie (CRL-200S) — tudo no robô, nada no Oráculo.
-# Deriva do dhruva-live.toml (01/10/2026) com:
-#   - sangam_address local (127.0.0.1) — o daemon sangam-io roda nesta mesma máquina
-#   - map_storage + session em /mnt/UDISK/dhruva (o robô nao tem /home/oangelo)
-#   - exploration e navigation DESLIGADOS: o dhruva SO streama pose/obstaculo;
-#     quem dirige o drive é o close-loop.py (malha fechada).
-# O GD32 NAO tem watchdog (medido 01/10: andou 1,03m apos kill -9). O dead-man do
-# sangam-io (default 3000ms) e a rede de seguranca: se o close-loop morrer com o TCP
-# aberto, o robô para em ~3s.
+# dhruva-slam EXPLORACAO na Rosie — tudo no robo. Deriva do dhruva-onboard.toml.
+# O dhruva e' o UNICO cliente TCP do sangam (arquitetura do repo): exploration
+# liga LiDAR+motores e dirige autonomamente (frontier). SEM close-loop (ele
+# roubava o slot TCP e congelava a pose do SLAM - diagnosticado 03/10).
+# Aviso: exploration dirige sem evitação por LiDAR (so bumper/cliff); requer
+# alguem olhando o robo. wheel_base 0.238 (recalibrado 02/10; era 0.209).
 
 [source]
 sangam_address = "127.0.0.1:5555"
@@ -117,7 +114,7 @@ max_iterations = 50
 tolerance = 1e-6
 
 [exploration]
-enabled = false
+enabled = true
 strategy = "frontier"
 loop_rate_hz = 10.0
 
@@ -135,7 +132,7 @@ blocked_radius = 0.15
 clustering_threshold = 0.5
 
 [navigation]
-enabled = false
+enabled = true
 update_rate_hz = 10.0
 robot_radius = 0.18
 safety_margin = 0.10
