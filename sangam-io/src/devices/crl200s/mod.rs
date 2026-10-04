@@ -114,6 +114,7 @@ impl DeviceDriver for CRL200SDriver {
             hardware.heartbeat_interval_ms,
             hardware.lidar_pwm,
             hardware.deadman_timeout_ms,
+            hardware.lidar_rail_off_settle_ms,
         )?;
 
         // Send initialization sequence

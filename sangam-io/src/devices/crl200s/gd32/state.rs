@@ -22,6 +22,8 @@ fn monotonic_ms() -> u64 {
 
 /// Default lidar PWM (60% gives ~330 RPM / 5.5Hz scan rate)
 const DEFAULT_LIDAR_PWM: u8 = 60;
+/// Default lidar rail-off settle (ms) in `ComponentState` before config overrides it.
+const DEFAULT_LIDAR_RAIL_OFF_SETTLE_MS: u64 = 10000;
 
 /// Shared component state for periodic refresh
 ///
@@ -58,6 +60,15 @@ pub struct ComponentState {
     /// Dead-man timeout in ms. If velocity is non-zero and no drive command
     /// arrives within this window, the heartbeat zeroes the motors.
     pub deadman_timeout_ms: AtomicU64,
+    /// How long the lidar rail stays OFF between `0x97 00` and `0x97 01` (ms).
+    ///
+    /// Issue #14/#17 (04/10/2026): o cold-start da 1ª partida a frio da sessão é
+    /// INTERMITENTE (7/8 de manhã, 6/6 à tarde, mesmo binário). A hipótese em aberto é
+    /// que `LIDAR_RAIL_OFF_SETTLE_MS=2000` (const), o valor mínimo comprovado, não
+    /// descarrega um sensor que ficou horas parado — a recuperação medida (03/10) usou
+    /// ~10 s de trilho off. Tornar configuravel (padrao 10 s) permite varrer 2/5/10 s em
+    /// varias sessoes sem rebuild, em vez de apostar num valor unico.
+    pub lidar_rail_off_settle_ms: AtomicU64,
     /// Whether the dead-man tripped (for observability only - the stop itself
     /// is performed by the heartbeat once it sees the staleness).
     pub deadman_tripped: AtomicBool,
@@ -85,9 +96,21 @@ impl ComponentState {
             wheel_motor_enabled: AtomicBool::new(false),
             last_drive_cmd_ms: AtomicU64::new(0),
             deadman_timeout_ms: AtomicU64::new(deadman_timeout_ms.max(100)),
+            lidar_rail_off_settle_ms: AtomicU64::new(DEFAULT_LIDAR_RAIL_OFF_SETTLE_MS),
             deadman_tripped: AtomicBool::new(false),
             lidar_scan_counter: OnceLock::new(),
         }
+    }
+
+    /// Rail-off settle (ms) that `lidar enable` holds `0x97 00` before `0x97 01`.
+    pub fn get_lidar_rail_off_settle_ms(&self) -> u64 {
+        self.lidar_rail_off_settle_ms.load(Ordering::Relaxed)
+    }
+
+    /// Override the rail-off settle (ms) from config (issue #14: pa ver se um OFF
+    /// mais longo, ~10 s, estabiliza o cold-start da 1ª partida a frio).
+    pub fn set_lidar_rail_off_settle_ms(&self, v: u64) {
+        self.lidar_rail_off_settle_ms.store(v, Ordering::Relaxed);
     }
 
     /// Record that a drive command was received (arms the dead-man's freshness
@@ -247,6 +270,27 @@ mod tests {
                 "vontade de comando (refresco) nao deve expirar"
             );
         }
+    }
+
+    #[test]
+    fn lidar_rail_off_settle_default_and_setter() {
+        let s = ComponentState::default();
+        assert_eq!(s.get_lidar_rail_off_settle_ms(), 10000,
+            "default deve ser 10 s (valor que destravou a recuperacao de 03/10, issue #14)");
+
+        // Setter sobrepoe o valor (config pode varrer 2/5/10 s sem rebuild).
+        s.set_lidar_rail_off_settle_ms(5000);
+        assert_eq!(s.get_lidar_rail_off_settle_ms(), 5000);
+        s.set_lidar_rail_off_settle_ms(2000);
+        assert_eq!(s.get_lidar_rail_off_settle_ms(), 2000);
+    }
+
+    #[test]
+    fn config_default_lidar_rail_off_settle_is_10000() {
+        // Garante que a config e o ComponentState partilham o mesmo default,
+        // senao o knob da config nao teria efeito ate ser setado explicitamente.
+        let cs = ComponentState::default();
+        assert_eq!(cs.get_lidar_rail_off_settle_ms(), 10000);
     }
 
     #[test]

@@ -97,15 +97,6 @@ const LIDAR_START_ATTEMPTS: u32 = 3;
 const LIDAR_VERIFY_TIMEOUT_MS: u64 = 8000;
 /// Poll interval while waiting for the scan counter to advance (ms).
 const LIDAR_VERIFY_POLL_MS: u64 = 100;
-/// How long the rail stays OFF between `0x97 00` and `0x97 01` (ms).
-///
-/// Issue #17 (03/10/2026): a fix de hoje de manha removeu o `0x97 00` do start, o que
-/// fez o trilho nunca mais ser ciclado -> sensor bom parte (8/8, 6/6) mas sensor
-/// TRAVADO nao recupera (0/6). O ciclo REAL do trilho e o que desbloqueia. 2 s e o
-/// minimo; a recuperacao medida no metal usou ~10 s, mas 2 s ja e um ciclo efetivo
-/// no protocolo (o OFF e engolido pela fabrica no boot so se vier ANTES do modo nav,
-/// e aqui vem depois).
-const LIDAR_RAIL_OFF_SETTLE_MS: u64 = 2000;
 /// Espera de BOOT depois do `0x97 01` (power ON), antes da rajada (ms).
 ///
 /// Bancada (medida 01/10): ciclo do trilho + rajada imediata (<1 s) = 0 byte por 20 s;
@@ -643,7 +634,10 @@ fn handle_lidar(
                             // First half of the real power cycle — un-sticks a stuck sensor.
                             pkt.set_lidar_power(false);
                             send_packet(port, pkt)?;
-                            thread::sleep(Duration::from_millis(LIDAR_RAIL_OFF_SETTLE_MS));
+                            // Tempo de OFF configurável (issue #14: ver se um OFF mais
+                            // longo, ~10 s, estabiliza o cold-start da 1ª partida a frio).
+                            let off = component_state.get_lidar_rail_off_settle_ms();
+                            thread::sleep(Duration::from_millis(off));
                         }
                         LidarStartStep::RailOn => {
                             pkt.set_lidar_power(true);

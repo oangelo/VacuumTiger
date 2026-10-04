@@ -368,6 +368,16 @@ pub struct HardwareConfig {
     #[serde(default = "default_lidar_pwm")]
     pub lidar_pwm: u8,
 
+    /// Lidar rail-off settle (ms) that `lidar enable` holds `0x97 00` (rail OFF)
+    /// before `0x97 01` (rail ON), on each start attempt.
+    ///
+    /// Issue #14 (04/10/2026): o cold-start da 1ª partida a frio da sessão é
+    /// intermitente; a hipótese em aberto é que um OFF curto demais (2 s) não
+    /// descarrega o sensor depois de horas parado — a recuperação medida (03/10)
+    /// usou ~10 s. Padrão: 10000 (10 s).
+    #[serde(default = "default_lidar_rail_off_settle_ms")]
+    pub lidar_rail_off_settle_ms: u64,
+
     /// Lidar mounting configuration for robot-center transformation
     ///
     /// Defines the physical mounting position of the lidar relative to
@@ -381,6 +391,12 @@ pub struct HardwareConfig {
 
 fn default_lidar_pwm() -> u8 {
     60
+}
+
+/// Default lidar rail-off settle (ms) — 10 s, o valor que destravou a recuperação
+/// medida em 03/10/2026 (a const anterior era 2000 ms, ambos os valores no protocolo).
+fn default_lidar_rail_off_settle_ms() -> u64 {
+    10000
 }
 
 /// Default dead-man switch timeout for wheel motors (see `deadman_timeout_ms`).

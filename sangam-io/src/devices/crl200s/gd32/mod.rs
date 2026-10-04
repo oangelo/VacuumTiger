@@ -101,7 +101,13 @@ impl GD32Driver {
     /// - `port_path`: Serial port path (e.g., "/dev/ttyS3")
     /// - `heartbeat_interval_ms`: Interval for heartbeat commands (20-50ms)
     /// - `lidar_pwm`: Initial PWM value for lidar motor (0-100%)
-    pub fn new(port_path: &str, heartbeat_interval_ms: u64, lidar_pwm: u8, deadman_timeout_ms: u64) -> Result<Self> {
+    pub fn new(
+        port_path: &str,
+        heartbeat_interval_ms: u64,
+        lidar_pwm: u8,
+        deadman_timeout_ms: u64,
+        lidar_rail_off_settle_ms: u64,
+    ) -> Result<Self> {
         let port = serialport::new(port_path, 115200)
             .timeout(Duration::from_millis(SERIAL_READ_TIMEOUT_MS))
             .open()
@@ -117,6 +123,13 @@ impl GD32Driver {
             "GD32 driver: dead-man timeout {} ms",
             deadman_timeout_ms.max(100)
         );
+        log::debug!(
+            "GD32 driver: lidar rail-off settle {} ms",
+            lidar_rail_off_settle_ms
+        );
+
+        let component_state = Arc::new(ComponentState::new(lidar_pwm, deadman_timeout_ms));
+        component_state.set_lidar_rail_off_settle_ms(lidar_rail_off_settle_ms);
 
         Ok(Self {
             port: Arc::new(Mutex::new(port)),
@@ -124,7 +137,7 @@ impl GD32Driver {
             shutdown: Arc::new(AtomicBool::new(false)),
             heartbeat_handle: None,
             reader_handle: None,
-            component_state: Arc::new(ComponentState::new(lidar_pwm, deadman_timeout_ms)),
+            component_state,
         })
     }
 

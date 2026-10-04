@@ -37,6 +37,13 @@ heartbeat_interval_ms = 20
 # The upstream default of 60 was an estimate; 73 is the observed value.
 lidar_pwm = 73
 
+# Lidar rail-off settle (ms): quanto o `lidar enable` segura 0x97 00 (OFF do trilho)
+# antes de 0x97 01 (ON). Issue #14 (04/10/2026): cold-start da 1ª partida a frio é
+# intermitente; hipótese = OFF curto demais (2 s) não descarrega o sensor após horas
+# parado. A recuperação medida (03/10) usou ~10 s -> default 10000. Para varrer
+# valores (2000/5000/10000) sem rebuild, mude aqui.
+lidar_rail_off_settle_ms = 10000
+
 # Dead-man switch timeout for the wheel motors (ms).
 # The GD32 holds the last commanded velocity indefinitely (no hardware watchdog).
 # The daemon stops the motors if no drive command arrives within this window while
