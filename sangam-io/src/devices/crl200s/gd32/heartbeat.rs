@@ -66,6 +66,21 @@ const MODE_SWITCH_DELAY_MS: u64 = 100;
 /// This appears to be a keep-alive/diagnostic query.
 const STM32_REQUEST_INTERVAL_MS: u64 = 1500;
 
+/// Intervalo do keep-alive de componente "escova principal" (0x6A) durante a
+/// tração contínua, em ms.
+///
+/// O firmware original mantém 0x6A periódico ~1,1s MESMO em tração continua
+/// (medido: 458x 0x6A junto de movimento, gap mediano ~1103ms). O GD32 corta
+/// as rodas quando o único "componente ativo" é a proprio tração — a escova
+/// (0x6A) conta como componente de fundo que mantém as rodas vivas; o LiDAR
+/// (0x71) isolado não basta (ver `CORTE_RODAS.md`). Usamos ~1s para
+/// replicar o gap original.
+const DRIVE_BRUSH_KEEPALIVE_INTERVAL_MS: u64 = 1000;
+
+/// Velocidade da escova de keep-alive (0-100%). Valor baixo: apenas sinaliza
+/// "componente ativo" ao GD32, sem estraçalhar o chão/consumir.
+const DRIVE_BRUSH_KEEPALIVE_SPEED: u8 = 30;
+
 /// Heartbeat loop - sends appropriate commands at configured interval
 ///
 /// This loop runs continuously on a dedicated OS thread to maintain the GD32 watchdog timer.
@@ -111,6 +126,25 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
     // Response contents are TBD but request is sent to match stock firmware behavior.
     let stm32_request_interval = STM32_REQUEST_INTERVAL_MS / interval_ms;
     let mut stm32_request_counter: u64 = 0;
+
+    // Keep-alive do componente "escova principal" (0x6A) durante a tracao.
+    //
+    // O firmware original, no meio da limpeza (tração contínua), mantém enviando
+    // 0x6A (escova) periódico ~1/s MESMO quando só as rodas estão tracionando —
+    // o GD32 para as rodas se NÃO houver outro componente ativo além da roda/dt.
+    // Medido (03/10 vs 01/10): original tinha 458x 0x6A junto de movimento (gap
+    // ~1.1s); o nosso sangam envia 0x6A NAO - zerado -> rodas cortam ~5s.
+    // Ver `CORTE_RODAS.md`.
+    let brush_keepalive_interval = DRIVE_BRUSH_KEEPALIVE_INTERVAL_MS / interval_ms;
+    let mut brush_keepalive_counter: u64 = 0;
+
+    // Deadline-based heartbeating: sleep until the *next* tick boundary instead of
+    // a fixed sleep *after* the work. A fixed `sleep(interval_ms)` after sending
+    // compounds any lock/send time into the cadence — measured on the CRL-200S at
+    // ~40ms (target 20ms), which the GD32 reads as a rate too low to keep the
+    // wheel motors alive. With a deadline we drift back to the correct rate even
+    // if a cycle runs late.
+    let mut next_tick = std::time::Instant::now() + std::time::Duration::from_millis(interval_ms);
 
     while !shutdown.load(Ordering::Relaxed) {
         // Use blocking lock to ensure commands are always sent
@@ -251,6 +285,30 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
                     log::error!("Lidar PWM send failed: {}", e);
                 }
             }
+
+            // Keep-alive de componente durante a tração continua: o GD32 corta as
+            // rodas quando o único componente ativo é a própria tração (ver const
+            // DRIVE_BRUSH_KEEPALIVE_*). Se a escova NAO foi pedida pelo cliente
+            // (main_brush == 0), nós a emitimos periodicamente (~1s) como o firmware
+            // original fazia, para manter um "componente de fundo" ativo. Se o
+            // cliente pediu escova (main_brush > 0), o bloco acima já a envia a cada
+            // ciclo e este keep-alive é redundante (não dispara).
+            let driving = linear != 0 || angular != 0;
+            if driving && main_brush == 0 {
+                brush_keepalive_counter += 1;
+                if brush_keepalive_counter >= brush_keepalive_interval {
+                    brush_keepalive_counter = 0;
+                    pkt.set_main_brush(DRIVE_BRUSH_KEEPALIVE_SPEED);
+                    if let Err(e) = pkt.send_to(&mut *port) {
+                        log::error!("Drive brush keep-alive (0x6A) send failed: {}", e);
+                    } else {
+                        log::debug!(
+                            "Drive brush keep-alive 0x6A={} (componente de fundo durante tração)",
+                            DRIVE_BRUSH_KEEPALIVE_SPEED
+                        );
+                    }
+                }
+            }
         } else {
             // No components active - send regular heartbeat
             if let Err(e) = heartbeat.send_to(&mut *port) {
@@ -274,7 +332,21 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
         // Explicitly release port mutex before sleeping to allow other threads
         // (reader, command handler) to access the serial port during our sleep period
         drop(port);
-        thread::sleep(Duration::from_millis(interval_ms));
+        // Sleep until the next tick boundary (drift-correcting), not a fixed sleep.
+        let now = std::time::Instant::now();
+        if now < next_tick {
+            thread::sleep(next_tick - now);
+        } else {
+            // We missed the window (lock contention / slow send); don't spiral —
+            // recompute against "now" so we don't busy-spin into the past.
+            log::trace!("heartbeat tick missed deadline by {:?}", now.duration_since(next_tick));
+        }
+        next_tick += std::time::Duration::from_millis(interval_ms);
+        // If we fell far behind (e.g. long block in the send path), keep the next
+        // deadline ahead of the current time rather than compounding catch-up.
+        if next_tick < std::time::Instant::now() {
+            next_tick = std::time::Instant::now() + std::time::Duration::from_millis(interval_ms);
+        }
     }
 
     log::info!("Heartbeat thread exiting");
