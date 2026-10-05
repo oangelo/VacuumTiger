@@ -253,10 +253,10 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
             // =========================================================
             // Colisão durante a marcha -> parada imediata (<200ms), sem passar
             // pelo DEAD-MAN. O reader publica `bumper_pressed` já mascarado por
-            // dock (criterio D: sem falso-positivo na base). Só freia se o robo
-            // estiver de fato se movendo (senão o bumper pressionado não infla
-            // a distância nem gera log repetido). A flag docked estando true
-            // mascarou o bumper no reader -> aqui nunca trava na base.
+            // dock OU charging (criterio D: sem falso-positivo na base — o bit
+            // de dock oscila, ver reader.rs). Só freia se o robo estiver de fato
+            // se movendo (senão o bumper pressionado não infla a distância nem
+            // gera log repetido). Com a base mascarada, aqui nunca trava na base.
             if component_state.bumper_pressed.load(Ordering::Relaxed)
                 && (linear != 0 || angular != 0)
             {

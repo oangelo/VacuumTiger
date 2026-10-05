@@ -87,6 +87,12 @@ pub struct ComponentState {
     /// True when the reader last saw the robot on the dock/charging. Used to
     /// mask bumper false-positives (the dock contact reads as bumper flags).
     pub is_dock_connected: AtomicBool,
+    /// True when the reader last saw the charging bit set in the status packet.
+    ///
+    /// O bit de dock oscila: na base carregando (medido 05/10) o pacote vem com
+    /// `docked=False charging=True` e os dois bumpers marcados. A mascara do
+    /// interlock usa este sinal junto com `is_dock_connected` (criterio D).
+    pub is_charging: AtomicBool,
     /// Scan counter of the lidar driver, attached once at device init.
     ///
     /// Used by `lidar enable` to verify that the sensor actually entered streaming
@@ -117,6 +123,7 @@ impl ComponentState {
             bumper_left: AtomicBool::new(false),
             bumper_right: AtomicBool::new(false),
             is_dock_connected: AtomicBool::new(false),
+            is_charging: AtomicBool::new(false),
             lidar_scan_counter: OnceLock::new(),
         }
     }

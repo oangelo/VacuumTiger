@@ -275,23 +275,29 @@ fn handle_status_packet(
     data.set("bumper_right", SensorValue::Bool(bump_r));
 
     // Charging/dock state (read out of the same status packet for the bumper mask).
-    let docked =
-        (payload[OFFSET_CHARGING_FLAGS] & FLAG_DOCK_CONNECTED) != 0;
+    let charging = (payload[OFFSET_CHARGING_FLAGS] & FLAG_CHARGING) != 0;
+    let docked = (payload[OFFSET_CHARGING_FLAGS] & FLAG_DOCK_CONNECTED) != 0;
 
     // Bumper interlock state for the heartbeat (issue #18, R2): publica os crus
-    // (p/ o log) e o mascarado (p/ o hard-stop). Na base a fábrica le as duas
-    // bordas como bumpers (0x06 = L|R) por causa do contato; se docked,
-    // mascaramos para nao parar o robo na base (criterio D).
+    // (p/ o log) e o mascarado (p/ o hard-stop). Na base o contato de carga
+    // aparece no pacote como "os dois bumpers" (0x06 em OFFSET_BUMPER_FLAGS) e
+    // o bit de dock oscila: medido 05/10 na base carregando ->
+    // docked=False charging=True bumpers L=R=True (1653/1653 amostras), enquanto
+    // em 04/10 a base aparecia como docked=True charging=False. Por isso a
+    // mascara usa os DOIS sinais (criterio D: sem falso-positivo na base).
     component_state
         .is_dock_connected
         .store(docked, Ordering::Relaxed);
+    component_state
+        .is_charging
+        .store(charging, Ordering::Relaxed);
     component_state.bumper_left.store(bump_l, Ordering::Relaxed);
     component_state
         .bumper_right
         .store(bump_r, Ordering::Relaxed);
     component_state
         .bumper_pressed
-        .store((bump_l || bump_r) && !docked, Ordering::Relaxed);
+        .store(bumper_press_masked(bump_l, bump_r, docked, charging), Ordering::Relaxed);
 
     // Wheel encoders
     data.set(
@@ -381,4 +387,45 @@ fn handle_status_packet(
 
     // Clone data for streaming before releasing lock
     Some(data.clone())
+}
+
+/// Decide whether the bumper flags should count as a real press.
+///
+/// O contato de carga da base aparece no pacote de status como "os dois
+/// bumpers" (byte 0x06 em `OFFSET_BUMPER_FLAGS`), e o bit de dock oscila entre
+/// os dois estados de contato medidos: 04/10 `docked=True charging=False`,
+/// 05/10 `docked=False charging=True` (1653/1653 amostras na base carregando).
+/// Mascarar por QUALQUER um dos dois mata o falso-positivo (criterio D) sem
+/// desarmar o interlock no chao, onde os dois bits sao falsos.
+fn bumper_press_masked(bump_l: bool, bump_r: bool, docked: bool, charging: bool) -> bool {
+    (bump_l || bump_r) && !(docked || charging)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bumper_press_masked;
+
+    #[test]
+    fn bumper_mask_keeps_real_press_on_the_floor() {
+        // Chao livre: nenhum sinal de base -> o interlock tem que ficar armado.
+        assert!(bumper_press_masked(true, false, false, false));
+        assert!(bumper_press_masked(false, true, false, false));
+        assert!(bumper_press_masked(true, true, false, false));
+        assert!(!bumper_press_masked(false, false, false, false));
+    }
+
+    #[test]
+    fn bumper_mask_ignores_dock_false_positive() {
+        // 05/10 na base carregando: docked=False, charging=True, L=R=True.
+        assert!(
+            !bumper_press_masked(true, true, false, true),
+            "falso-positivo da base carregando nao pode virar BUMPER-STOP (criterio D)"
+        );
+        // 04/10 na base (outro estado de contato): docked=True, charging=False.
+        assert!(
+            !bumper_press_masked(true, true, true, false),
+            "contato de dock tambem mascara o bumper"
+        );
+        assert!(!bumper_press_masked(true, false, true, true));
+    }
 }
