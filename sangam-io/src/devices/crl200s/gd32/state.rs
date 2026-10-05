@@ -3,7 +3,7 @@
 //! This module defines the shared state used by the heartbeat thread to refresh
 //! component commands every 20ms. All fields use atomic types to allow lockless reads.
 
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU16, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -20,10 +20,70 @@ fn monotonic_ms() -> u64 {
     epoch.elapsed().as_millis() as u64
 }
 
+/// O mesmo relogio monotono, exposto para o reader carimbar os latches da
+/// mascara de bumper (`dock_signal_ms`, `press_since_ms`, `last_motion_ms`).
+pub fn monotonic_now_ms() -> u64 {
+    monotonic_ms()
+}
+
 /// Default lidar PWM (60% gives ~330 RPM / 5.5Hz scan rate)
 const DEFAULT_LIDAR_PWM: u8 = 60;
 /// Default lidar rail-off settle (ms) in `ComponentState` before config overrides it.
 const DEFAULT_LIDAR_RAIL_OFF_SETTLE_MS: u64 = 10000;
+
+/// Quanto tempo um sinal de base (`docked` OU `charging`) continua valendo
+/// depois de visto (ms).
+///
+/// Medido 05/10/2026 (probe na base, `dock-flag-probe.py`): o byte de flags de
+/// carga (0x07) OSCILA a ~50 Hz entre `docked`, `charging` e — enquanto ha
+/// comando de tracao — janelas em que os DOIS ficam False (medido: gaps de ate
+/// ~0,9 s na saida da base). Uma mascara instantanea vira corrida: qualquer
+/// amostra "ambos False" com o falso-positivo de bumper na base dispara o
+/// interlock e mata o primeiro comando de tracao (`BUMPER-STOP L=true R=true`,
+/// medido 12:54Z). Por isso o sinal e latching.
+pub const DOCK_SIGNAL_HOLD_MS: u64 = 1500;
+
+/// Pressao "estatica": bumper pressionado ha mais de X ms COM AS RODAS PARADAS
+/// e' assinatura de base (o contato de carga marca os dois bumpers), nao de
+/// colisao — uma colisao acontece com o robo andando. Medido 05/10: na base o
+/// byte de bumper le 0x06 (os dois) em 100% das amostras, inclusive parado.
+pub const STATIC_PRESS_MS: u64 = 1000;
+
+/// Janela para considerar que as rodas "nao se mexem" (ms).
+pub const WHEEL_STILL_MS: u64 = 1000;
+
+/// Decide se uma leitura de bumper deve ser tratada como colisao de verdade.
+///
+/// Mascarada quando:
+/// - um sinal de base foi visto nos ultimos [`DOCK_SIGNAL_HOLD_MS`] (o byte de
+///   flags de carga oscila, ver o comentario da constante); ou
+/// - pressao estatica: pressionado ha mais de [`STATIC_PRESS_MS`] com as rodas
+///   paradas ha [`WHEEL_STILL_MS`] (assinatura do contato de carga na base).
+///
+/// Fora da base as duas condicoes sao falsas -> o interlock fica armado e a
+/// colisao real (pressao que aparece com o robo andando) para as rodas.
+pub fn bumper_press_masked(
+    pressed_raw: bool,
+    now_ms: u64,
+    dock_signal_ms: u64,
+    press_since_ms: u64,
+    last_motion_ms: u64,
+) -> bool {
+    if !pressed_raw {
+        return false;
+    }
+    if dock_signal_ms != 0 && now_ms.saturating_sub(dock_signal_ms) < DOCK_SIGNAL_HOLD_MS {
+        return false;
+    }
+    let press_age = if press_since_ms == 0 {
+        0
+    } else {
+        now_ms.saturating_sub(press_since_ms)
+    };
+    let wheels_still = last_motion_ms == 0
+        || now_ms.saturating_sub(last_motion_ms) >= WHEEL_STILL_MS;
+    !(press_age >= STATIC_PRESS_MS && wheels_still)
+}
 
 /// Shared component state for periodic refresh
 ///
@@ -93,6 +153,16 @@ pub struct ComponentState {
     /// `docked=False charging=True` e os dois bumpers marcados. A mascara do
     /// interlock usa este sinal junto com `is_dock_connected` (criterio D).
     pub is_charging: AtomicBool,
+    /// Monotonic ms da ultima vez que um sinal de base (`docked` OU `charging`)
+    /// foi visto. 0 = nunca. A mascara usa isto como latch (o byte oscila).
+    pub dock_signal_ms: AtomicU64,
+    /// Monotonic ms em que a pressao de bumper atual COMECOU (0 = nao pressionado).
+    pub press_since_ms: AtomicU64,
+    /// Monotonic ms do ultimo pacote em que os encoders mudaram.
+    pub last_motion_ms: AtomicU64,
+    /// Ultimo par de contadores de roda visto (para detectar movimento real).
+    pub prev_wheel_left: AtomicU16,
+    pub prev_wheel_right: AtomicU16,
     /// Scan counter of the lidar driver, attached once at device init.
     ///
     /// Used by `lidar enable` to verify that the sensor actually entered streaming
@@ -124,6 +194,11 @@ impl ComponentState {
             bumper_right: AtomicBool::new(false),
             is_dock_connected: AtomicBool::new(false),
             is_charging: AtomicBool::new(false),
+            dock_signal_ms: AtomicU64::new(0),
+            press_since_ms: AtomicU64::new(0),
+            last_motion_ms: AtomicU64::new(0),
+            prev_wheel_left: AtomicU16::new(0),
+            prev_wheel_right: AtomicU16::new(0),
             lidar_scan_counter: OnceLock::new(),
         }
     }
@@ -335,5 +410,41 @@ mod tests {
     fn default_timeout_clamped_to_minimum() {
         let s = ComponentState::new(DEFAULT_LIDAR_PWM, 10); // abaixo do minimo
         assert_eq!(s.deadman_timeout_ms.load(Ordering::Relaxed), 100);
+    }
+
+    // ---- mascara do interlock de bumper (criterio D, #18) -------------------
+
+    #[test]
+    fn bumper_mask_arms_on_the_floor() {
+        // Chao: sem sinal de base, rodas andando, pressao nova -> COLISAO.
+        let now = 100_000;
+        assert!(bumper_press_masked(true, now, 0, now - 10, now - 20));
+        // Nem pressionado -> nada.
+        assert!(!bumper_press_masked(false, now, 0, 0, now - 20));
+    }
+
+    #[test]
+    fn bumper_mask_holds_dock_signal_through_the_flag_flicker() {
+        // Medido 05/10: na saida da base o byte de flags oscila e fica ~0,9 s com
+        // os DOIS bits False. O latch tem que cobrir essa janela.
+        let now = 100_000;
+        let dock_seen = now - 900; // visto ha 0,9 s, agora tudo False
+        assert!(
+            !bumper_press_masked(true, now, dock_seen, now - 5_000, now - 10),
+            "latch de 1,5 s deve mascarar o falso-positivo na janela de oscilacao"
+        );
+        // Passado o hold, e com rodas andando -> volta a valer como colisao.
+        assert!(bumper_press_masked(true, now, now - 2_000, now - 10, now - 10));
+    }
+
+    #[test]
+    fn bumper_mask_ignores_static_press_on_the_dock() {
+        // Na base: pressao continua ha minutos, rodas paradas -> NAO e colisao,
+        // mesmo se o sinal de dock nunca tiver sido visto.
+        let now = 100_000;
+        assert!(!bumper_press_masked(true, now, 0, now - 60_000, now - 60_000));
+        // Borda: pressao de 0,5 s com rodas paradas ainda conta como colisao
+        // (nao ha assinatura de base) -> conservador, para as rodas.
+        assert!(bumper_press_masked(true, now, 0, now - 500, now - 5_000));
     }
 }
