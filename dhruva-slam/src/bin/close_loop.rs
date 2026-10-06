@@ -604,6 +604,14 @@ struct Args {
     /// antigo, que tambem para por obstaculo frontal pelo LidarScan).
     #[arg(long, default_value = "odom")]
     straight_source: String,
+    /// RECEITA: sequencia de passos numa UNICA sessao (uma conexao TCP, o LiDAR ligado
+    /// uma vez so). Ex.: `--recipe "straight:1.2,spin:180,straight:1.2"`.
+    /// Existe para FECHAR MALHA: o robo precisa sair e VOLTAR ao lugar onde ja' esteve
+    /// para o loop closure do dhruva casar as varreduras antigas com as novas. Com uma
+    /// acao por invocacao isso era impossivel (cada fim de processo derruba a conexao,
+    /// desliga o LiDAR e pausa o stream UDP).
+    #[arg(long, default_value = "")]
+    recipe: String,
 }
 
 struct Controller {
@@ -654,7 +662,10 @@ impl Controller {
         // sangam_raw), entao nao travamos por ele.
         let odom_spin = args.spin.is_some() && args.spin_source != "slam";
         let odom_straight = args.straight.is_some() && args.straight_source != "slam";
-        let need_dhruva = (args.spin.is_some() && args.spin_source == "slam")
+        // Em receita as fontes viram slam e nenhuma abre o UDP (ver main).
+        let receita = !args.recipe.is_empty();
+        let need_dhruva = receita
+            || (args.spin.is_some() && args.spin_source == "slam")
             || (args.straight.is_some() && args.straight_source == "slam")
             || args.dry_run;
         // No straight-odom nem TENTAMOS conectar o dhruva: o straight roda sozinho
@@ -737,6 +748,24 @@ impl Controller {
         }
         self.drive
             .write(&drive_cmd(ACTION_CONFIGURE, vec![("linear", linear), ("angular", angular)]))
+    }
+
+    /// Manda StopMapping(save=true): o `stop_drive` so' solta as rodas, NAO salva o mapa.
+    /// Sem isto a rodada termina e o mapa fica so' na memoria do dhruva.
+    fn stop_mapping_save(&mut self) {
+        if let Some(s) = self.slam.as_mut() {
+            let mut cmd = dhruva::DhruvaCommand::default();
+            cmd.request_id = "stop-close-loop".to_string();
+            cmd.command = Some(dhruva::dhruva_command::Command::StopMapping(
+                dhruva::StopMappingCommand { save: true },
+            ));
+            match s.write(&cmd) {
+                Ok(_) => eprintln!("-> StopMapping(save=true) enviado — mapa na sessao do dhruva"),
+                Err(e) => eprintln!("!! falha ao enviar StopMapping: {e}"),
+            }
+        } else {
+            eprintln!("-> sem conexao com o dhruva: nao ha mapa para salvar");
+        }
     }
 
     fn stop_drive(&mut self) {
@@ -1097,14 +1126,47 @@ impl Controller {
     }
 }
 
+/// `--recipe "straight:1.2,spin:180,straight:1.2"` -> [(passo, valor)].
+fn parse_recipe(s: &str) -> Vec<(String, f32)> {
+    let mut out = Vec::new();
+    for item in s.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let mut it = item.split(':');
+        let nome = it.next().unwrap_or("").trim().to_lowercase();
+        let val = it.next().unwrap_or("0").trim().parse::<f32>().unwrap_or(0.0);
+        if nome == "straight" || nome == "spin" {
+            out.push((nome, val));
+        } else {
+            eprintln!("!! passo desconhecido na receita: '{item}' (use straight:METROS / spin:GRAUS)");
+        }
+    }
+    out
+}
+
 fn main() -> std::io::Result<()> {
     env_logger::init();
-    let args = Args::parse();
+    let mut args = Args::parse();
 
-    let both = args.spin.is_some() == args.straight.is_some();
-    if both {
-        eprintln!("escolha exatamente um: --spin THETA ou --straight METROS");
-        std::process::exit(2);
+    let passos = parse_recipe(&args.recipe);
+    if passos.is_empty() {
+        let both = args.spin.is_some() == args.straight.is_some();
+        if both {
+            eprintln!("escolha exatamente um: --spin THETA ou --straight METROS (ou --recipe ...)");
+            std::process::exit(2);
+        }
+    } else {
+        // Receita: forca as fontes SLAM. Razao de ARQUITETURA — em modo odometria o
+        // close_loop abre um SEGUNDO socket UDP na 5555 e rouba bytes do receiver do
+        // dhruva (o SLAM congela). Com a fonte SLAM nao abrimos o UDP: o dhruva recebe
+        // tudo, e o reto ainda para por obstaculo frontal.
+        if args.spin_source != "slam" || args.straight_source != "slam" {
+            eprintln!("-> receita: forcando --spin-source slam e --straight-source slam                        (em odometria o close_loop rouba o UDP do dhruva e o SLAM congela)");
+        }
+        args.spin_source = "slam".to_string();
+        args.straight_source = "slam".to_string();
     }
     if args.straight.is_some() && args.straight_source != "odom" && args.straight_source != "slam" {
         eprintln!("--straight-source deve ser \"odom\" (padrao) ou \"slam\"");
@@ -1112,13 +1174,35 @@ fn main() -> std::io::Result<()> {
     }
 
     let mut ctrl = Controller::new(args.clone())?;
-    let ok = if let Some(t) = args.spin {
+    let ok = if !passos.is_empty() {
+        let total = passos.len();
+        let mut tudo_ok = true;
+        for (i, (nome, val)) in passos.iter().enumerate() {
+            eprintln!("\n== receita {}/{total}: {nome} {val:+.2} ==", i + 1);
+            let r = match nome.as_str() {
+                "straight" => ctrl.straight(*val),
+                "spin" => ctrl.spin(*val),
+                _ => false,
+            };
+            if !r {
+                eprintln!("!! passo '{nome} {val}' FALHOU — abortando a receita (nao anda o resto)");
+                tudo_ok = false;
+                break;
+            }
+        }
+        tudo_ok
+    } else if let Some(t) = args.spin {
         ctrl.spin(t)
     } else {
         ctrl.straight(args.straight.unwrap())
     };
     // stop sempre (igual finally do python) - vale inclusive no Ctrl-C (SIGINT do terminal)
     ctrl.stop_drive();
+    // Salva o mapa da sessao (sem isto a rodada termina e o mapa se perde).
+    if !args.dry_run {
+        ctrl.stop_mapping_save();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
     std::process::exit(if ok { 0 } else { 1 });
 }
 
