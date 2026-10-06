@@ -604,6 +604,11 @@ struct Args {
     /// antigo, que tambem para por obstaculo frontal pelo LidarScan).
     #[arg(long, default_value = "odom")]
     straight_source: String,
+    /// Fica IDLE por N segundos segurando a conexao (LiDAR ligado + StartMapping ativo),
+    /// SEM comandar as rodas. Bancada: mede a memoria/cpu do SLAM com o robo PARADO,
+    /// isolando o custo de MAPEAR do custo de MOVER.
+    #[arg(long)]
+    idle: Option<f32>,
     /// RECEITA: sequencia de passos numa UNICA sessao (uma conexao TCP, o LiDAR ligado
     /// uma vez so). Ex.: `--recipe "straight:1.2,spin:180,straight:1.2"`.
     /// Existe para FECHAR MALHA: o robo precisa sair e VOLTAR ao lugar onde ja' esteve
@@ -665,6 +670,7 @@ impl Controller {
         // Em receita as fontes viram slam e nenhuma abre o UDP (ver main).
         let receita = !args.recipe.is_empty();
         let need_dhruva = receita
+            || args.idle.is_some()
             || (args.spin.is_some() && args.spin_source == "slam")
             || (args.straight.is_some() && args.straight_source == "slam")
             || args.dry_run;
@@ -1151,13 +1157,13 @@ fn main() -> std::io::Result<()> {
     let mut args = Args::parse();
 
     let passos = parse_recipe(&args.recipe);
-    if passos.is_empty() {
+    if passos.is_empty() && args.idle.is_none() {
         let both = args.spin.is_some() == args.straight.is_some();
         if both {
-            eprintln!("escolha exatamente um: --spin THETA ou --straight METROS (ou --recipe ...)");
+            eprintln!("escolha exatamente um: --spin THETA, --straight METROS, --recipe ... ou --idle SEGS");
             std::process::exit(2);
         }
-    } else {
+    } else if !passos.is_empty() {
         // Receita: forca as fontes SLAM. Razao de ARQUITETURA — em modo odometria o
         // close_loop abre um SEGUNDO socket UDP na 5555 e rouba bytes do receiver do
         // dhruva (o SLAM congela). Com a fonte SLAM nao abrimos o UDP: o dhruva recebe
@@ -1174,7 +1180,12 @@ fn main() -> std::io::Result<()> {
     }
 
     let mut ctrl = Controller::new(args.clone())?;
-    let ok = if !passos.is_empty() {
+    let ok = if let Some(secs) = args.idle {
+        eprintln!("idle por {secs:.0}s: LiDAR ligado + StartMapping ativo, rodas PARADAS");
+        std::thread::sleep(std::time::Duration::from_secs_f32(secs));
+        eprintln!("idle terminou (o cliente vai fechar a conexao e o dhruva perde o stream)");
+        true
+    } else if !passos.is_empty() {
         let total = passos.len();
         let mut tudo_ok = true;
         for (i, (nome, val)) in passos.iter().enumerate() {
